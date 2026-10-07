@@ -791,7 +791,7 @@ describe('agent loop recovery and terminal states', () => {
     const provider = scriptedProvider([JSON.stringify({ action: 'click', ref: 'e3' })]);
     const loop = new AgentLoop(session, provider, {
       maxSteps: 5,
-      policyCheck: async () => ({ confirm: 'clicking might submit a form — approve?' }),
+      policyCheck: async () => ({ verdict: 'confirm', risk: 'medium', reason: 'clicking might submit a form — approve?' }),
     });
     const trace = await loop.run('do the thing');
     expect(trace.status).toBe('awaiting_confirmation');
@@ -803,7 +803,7 @@ describe('agent loop recovery and terminal states', () => {
     const provider = scriptedProvider([JSON.stringify({ action: 'click', ref: 'e3' })]);
     const loop = new AgentLoop(session, provider, {
       maxSteps: 5,
-      policyCheck: async () => ({ deny: 'clicking is disabled in this context' }),
+      policyCheck: async () => ({ verdict: 'deny', risk: 'medium', reason: 'clicking is disabled in this context' }),
     });
     const trace = await loop.run('do the thing');
     expect(trace.status).toBe('blocked');

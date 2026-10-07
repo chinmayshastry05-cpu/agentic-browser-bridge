@@ -518,6 +518,7 @@ export abstract class PageBackendBase implements BrowserBackend {
           visible: boolean;
           value?: string;
           checked?: boolean;
+          inputType?: string;
         } = {
           role,
           name,
@@ -540,6 +541,8 @@ export abstract class PageBackendBase implements BrowserBackend {
         if (el.getAttribute('role') === 'checkbox' || el.getAttribute('role') === 'switch') {
           out.checked = el.getAttribute('aria-checked') === 'true';
         }
+        const inputType = el.getAttribute('type');
+        if (inputType) out.inputType = inputType.toLowerCase();
         return out;
       });
     } catch {

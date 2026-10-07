@@ -232,6 +232,8 @@ export interface TargetDescription {
   value?: string;
   /** Checked state for checkbox/radio/switch (when applicable). */
   checked?: boolean;
+  /** The input's type attribute (e.g. "password") — used by the policy engine. */
+  inputType?: string;
 }
 
 /**

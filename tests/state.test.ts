@@ -81,16 +81,19 @@ describe('TaskStore', () => {
     const store = tmpStore();
     const a = store.create('first');
     const b = store.create('second');
+    const dir = (store as unknown as { tasksDir: string }).tasksDir;
+    const backdate = (taskId: string, daysAgo: number) => {
+      const raw = JSON.parse(readFileSync(join(dir, `${taskId}.json`), 'utf8'));
+      raw.updatedAt = new Date(Date.now() - daysAgo * 24 * 3600 * 1000).toISOString();
+      writeFileSync(join(dir, `${taskId}.json`), JSON.stringify(raw));
+    };
+
+    backdate(a.taskId, 1); // a is older than b
     const listed = store.list();
     expect(listed.map((t) => t.taskId)).toEqual([b.taskId, a.taskId]);
 
     store.close(a.taskId, 'failed', 'old');
-    // Backdate a's file to force pruning.
-    const dir = (store as unknown as { tasksDir: string }).tasksDir;
-    const raw = JSON.parse(readFileSync(join(dir, `${a.taskId}.json`), 'utf8'));
-    raw.updatedAt = new Date(Date.now() - 40 * 24 * 3600 * 1000).toISOString();
-    writeFileSync(join(dir, `${a.taskId}.json`), JSON.stringify(raw));
-
+    backdate(a.taskId, 40); // a is now prune-eligible
     const pruned = store.prune(30);
     expect(pruned).toEqual([a.taskId]);
     expect(store.list().map((t) => t.taskId)).toEqual([b.taskId]);

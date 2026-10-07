@@ -27,6 +27,7 @@ beforeAll(async () => {
     if (req.url === '/v1.html') {
       res.writeHead(200, { 'content-type': 'text/html' });
       res.end(fixture('v1.html'));
+      res.end(fixture('v1.html'));
     } else if (req.url === '/frame.html') {
       res.writeHead(200, { 'content-type': 'text/html' });
       res.end(fixture('frame.html'));
@@ -280,4 +281,24 @@ describe('M2 browser tool surface (real headless Chromium)', () => {
       await session.close();
     }
   }, 90_000);
+
+  it('detects password fields so the policy engine can require confirmation', async () => {
+    const { PolicyEngine } = await import('../src/security/policy.js');
+    const session = await makeSession();
+    try {
+      const pwRef = refByName(session, 'Password');
+      const desc = await session.describeLiveTarget(pwRef);
+      expect(desc?.inputType).toBe('password');
+
+      const engine = new PolicyEngine();
+      const decision = engine.decide(
+        { action: 'type', ref: pwRef, text: 's3cret' },
+        { inputType: desc?.inputType },
+      );
+      expect(decision.verdict).toBe('confirm');
+      expect(decision.risk).toBe('high');
+    } finally {
+      await session.close();
+    }
+  }, 60_000);
 });

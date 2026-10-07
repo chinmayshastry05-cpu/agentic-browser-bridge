@@ -19,6 +19,8 @@
 <h1>Agentic Browser Bridge</h1>
 <div class="row"><span id="dot" class="dot"></span><span id="status">checking…</span></div>
 <div class="row"><input id="wsUrl" placeholder="ws://127.0.0.1:8932/extension"><button id="save">Save</button></div>
+<div class="row"><input id="pairingToken" type="password" placeholder="relay pairing token (bridge console)"><button id="pair">Pair</button></div>
+<div id="pairState" class="note"></div>
 <div id="err" class="err"></div>
 <div class="note">Companion for the local bridge. Talks only to this machine (loopback). Load unpacked via chrome://extensions → Developer mode.</div>
 <script src="popup.js"></script>

@@ -11,13 +11,24 @@ import { mkdtempSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WebSocket } from 'ws';
-import { ExtensionRelay } from '../src/browser/extension-relay.js';
+import { ExtensionRelay, EXTENSION_ORIGIN, PINNED_EXTENSION_ID } from '../src/browser/extension-relay.js';
 import { ExtensionBackend } from '../src/browser/extension-backend.js';
 
 type Handler = (params: Record<string, unknown>) => unknown;
 
-function fakePeer(port: number, handlers: Record<string, Handler>): WebSocket {
-  const ws = new WebSocket(`ws://127.0.0.1:${port}/extension`);
+const TEST_PAIRING_TOKEN = 'test-pairing-token-abc123';
+
+function fakePeer(
+  port: number,
+  handlers: Record<string, Handler>,
+  opts: { token?: string | null; origin?: string } = {},
+): WebSocket {
+  const token = opts.token === undefined ? TEST_PAIRING_TOKEN : opts.token;
+  const url =
+    token === null
+      ? `ws://127.0.0.1:${port}/extension`
+      : `ws://127.0.0.1:${port}/extension?token=${encodeURIComponent(token)}`;
+  const ws = new WebSocket(url, { origin: opts.origin ?? EXTENSION_ORIGIN });
   ws.on('message', (data) => {
     const msg = JSON.parse(data.toString()) as { id: number | string; op: string; params?: Record<string, unknown> };
     const fn = handlers[msg.op];
@@ -99,7 +110,7 @@ describe('ExtensionRelay', () => {
   let peer: WebSocket | null = null;
 
   beforeEach(async () => {
-    relay = new ExtensionRelay();
+    relay = new ExtensionRelay({ pairingToken: TEST_PAIRING_TOKEN });
     await relay.listen(0);
   });
 
@@ -138,7 +149,7 @@ describe('ExtensionRelay', () => {
 
   it('rejects sends and waitForPeer when no peer is connected', async () => {
     await expect(relay.sendOp('ping', {}, 100)).rejects.toThrow(/not connected/);
-    await expect(relay.waitForPeer(100)).rejects.toThrow(/no extension connected/);
+    await expect(relay.waitForPeer(100)).rejects.toThrow(/no paired extension connected/);
   });
 
   it('fails pending ops when the peer disconnects', async () => {
@@ -159,7 +170,7 @@ describe('ExtensionBackend (fake peer)', () => {
   const log = { ops: [] as string[] };
 
   beforeEach(async () => {
-    relay = new ExtensionRelay();
+    relay = new ExtensionRelay({ pairingToken: TEST_PAIRING_TOKEN });
     const { port } = await relay.listen(0);
     log.ops = [];
     peer = fakePeer(port, standardHandlers(log));
@@ -239,8 +250,117 @@ describe('ExtensionBackend without a peer', () => {
     await relay.listen(0);
     const backend = new ExtensionBackend({ relay });
     await expect(backend.start({ headless: true, navigationTimeoutMs: 200 })).rejects.toThrow(
-      /no extension connected/,
+      /no paired extension connected/,
     );
     await relay.close();
+  });
+});
+
+describe('ExtensionRelay pairing + origin pinning (round 3)', () => {
+  const HERE = new URL('./', import.meta.url).pathname;
+  const portOf = (r: ExtensionRelay): number =>
+    (r as unknown as { listeningPort: number }).listeningPort;
+
+  /** Connect a raw socket; resolves with the handshake error (or 'connected'). */
+  function rawConnect(port: number, opts: { token?: string | null; origin?: string }): Promise<string> {
+    const query = opts.token === undefined || opts.token === null ? '' : `?token=${encodeURIComponent(opts.token)}`;
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/extension${query}`, {
+      origin: opts.origin ?? EXTENSION_ORIGIN,
+    });
+    return new Promise((resolve) => {
+      ws.once('error', (e: Error) => resolve(`error: ${e.message}`));
+      ws.once('open', () => {
+        ws.close();
+        resolve('connected');
+      });
+    });
+  }
+
+  it('manifest "key" derives to the pinned extension id', async () => {
+    const { createHash } = await import('node:crypto');
+    const manifest = JSON.parse(
+      readFileSync(join(HERE, '..', 'extension', 'manifest.json'), 'utf8'),
+    ) as { key?: string; version?: string };
+    expect(typeof manifest.key).toBe('string');
+    const der = Buffer.from(manifest.key!, 'base64');
+    const digest = createHash('sha256').update(der).digest().subarray(0, 16);
+    let id = '';
+    for (const b of digest) id += String.fromCharCode(0x61 + (b >> 4), 0x61 + (b & 0x0f));
+    expect(id).toBe(PINNED_EXTENSION_ID);
+    expect(EXTENSION_ORIGIN).toBe(`chrome-extension://${PINNED_EXTENSION_ID}`);
+  });
+
+  it('rejects sockets without a pairing token (401); never becomes a peer', async () => {
+    const relay = new ExtensionRelay({ pairingToken: TEST_PAIRING_TOKEN });
+    await relay.listen(0);
+    try {
+      const result = await rawConnect(portOf(relay), { token: null });
+      expect(result).toMatch(/401/);
+      expect(relay.hasPeer).toBe(false);
+    } finally {
+      await relay.close();
+    }
+  });
+
+  it('rejects sockets with a wrong pairing token (401)', async () => {
+    const relay = new ExtensionRelay({ pairingToken: TEST_PAIRING_TOKEN });
+    await relay.listen(0);
+    try {
+      const result = await rawConnect(portOf(relay), { token: 'wrong-token' });
+      expect(result).toMatch(/401/);
+      expect(relay.hasPeer).toBe(false);
+    } finally {
+      await relay.close();
+    }
+  });
+
+  it('rejects sockets with a wrong Origin (403), even with the right token', async () => {
+    const relay = new ExtensionRelay({ pairingToken: TEST_PAIRING_TOKEN });
+    await relay.listen(0);
+    try {
+      const result = await rawConnect(portOf(relay), {
+        token: TEST_PAIRING_TOKEN,
+        origin: 'chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      });
+      expect(result).toMatch(/403/);
+      expect(relay.hasPeer).toBe(false);
+    } finally {
+      await relay.close();
+    }
+  });
+
+  it('a paired socket with the pinned origin connects and drives an op', async () => {
+    const relay = new ExtensionRelay({ pairingToken: TEST_PAIRING_TOKEN });
+    await relay.listen(0);
+    let peer: WebSocket | null = null;
+    try {
+      peer = fakePeer(portOf(relay), { ping: () => ({ pong: true }) });
+      await waitOpen(peer);
+      await relay.waitForPeer(2000);
+      expect(relay.hasPeer).toBe(true);
+      expect(await relay.sendOp('ping')).toEqual({ pong: true });
+    } finally {
+      peer?.close();
+      await relay.close();
+    }
+  });
+
+  it('generates a 128-bit pairing token and prints it once when not configured', async () => {
+    const lines: string[] = [];
+    const orig = process.stderr.write;
+    process.stderr.write = ((c: unknown) => {
+      lines.push(String(c));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const relay = new ExtensionRelay();
+      expect(relay.token).toBeNull(); // not generated until listen()
+      await relay.listen(0);
+      expect(relay.token).toMatch(/^[0-9a-f]{32}$/); // 128 bits
+      expect(lines.join('')).toMatch(/pairing token \(shown once/);
+      await relay.close();
+    } finally {
+      process.stderr.write = orig;
+    }
   });
 });

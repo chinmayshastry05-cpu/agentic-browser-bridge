@@ -23,11 +23,21 @@ snapshot/click/type/scroll inside the page using the extension APIs
    node dist/src/index.js serve --backend extension
    ```
    (or select the extension backend in the UI/config you use).
-2. The bridge listens for the extension on `ws://127.0.0.1:8932/extension`
+2. The relay prints a **pairing token** (128-bit, shown once) on startup.
+   In the extension popup, paste it into the pairing field and click
+   **Pair**. The token is stored in `chrome.storage.local`; the service
+   worker sends it as `?token=` on every connect, and the relay drops any
+   socket without the right token (401) — so a random local WebSocket
+   client can never drive your browser through the relay.
+3. The relay additionally pins the WebSocket `Origin` header to the
+   companion extension's stable id (`chrome-extension://…`, derived from
+   the `"key"` field in `extension/manifest.json`); any other origin is
+   rejected (403), even with the token.
+4. The bridge listens for the extension on `ws://127.0.0.1:8932/extension`
    by default. The extension dials the relay URL shown in its popup
    (editable there; it only accepts `ws://127.0.0.1` / `ws://localhost`
    URLs — it will never connect to a remote host).
-3. When the service worker connects, the popup shows **connected** and the
+5. When the service worker connects, the popup shows **connected** and the
    bridge can list tabs, navigate, snapshot, click, type, and screenshot
    the active tab.
 
@@ -65,6 +75,9 @@ Streamable HTTP.
 
 - The relay binds **127.0.0.1 only** and speaks plain WebSocket on
   loopback — never expose this port; it is browser control.
+- **Pairing required:** the relay rejects any socket without the pairing
+  token (401) and any WebSocket `Origin` other than the companion
+  extension's pinned id (403). Pair via the extension popup.
 - The extension cannot be pointed at a remote relay URL (validated in the
   popup and the service worker).
 - The same policy engine, confirmation gates, and secret redaction apply

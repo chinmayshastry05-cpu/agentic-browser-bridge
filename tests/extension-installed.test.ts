@@ -46,7 +46,33 @@ function unpackedExtensionId(absPath: string): string {
   return id;
 }
 
-/** Launch Chromium with the extension and wait for the relay peer. */
+/** Pairing token the test relay expects; seeded into the extension below. */
+const EXT_TEST_TOKEN = 'ext-installed-test-token-123';
+
+/** Find the extension's service worker (it hosts background.js). */
+async function extensionWorker(ctx: BrowserContext) {
+  const found = ctx.serviceWorkers().find((w) => w.url().includes('background'));
+  if (found) return found;
+  return ctx.waitForEvent('serviceworker', { timeout: 20_000 });
+}
+
+/**
+ * Seed the relay pairing token into the extension's chrome.storage and
+ * force a reconnect. The background's eager first connect has no token and
+ * is rejected (401) by design; this pairs it for real, like the popup flow.
+ */
+async function seedPairingToken(ctx: BrowserContext, token: string): Promise<void> {
+  const sw = await extensionWorker(ctx);
+  await sw.evaluate(
+    `(async () => {
+      await chrome.storage.local.set({ pairingToken: ${JSON.stringify(token)} });
+      try { ws.close(); } catch (e) {}
+      await connect();
+    })()`,
+  );
+}
+
+/** Launch Chromium with the extension and wait for the paired relay peer. */
 async function launchWithExtension(opts: {
   userDataDir: string;
   seedFileAccess: boolean;
@@ -70,9 +96,10 @@ async function launchWithExtension(opts: {
       '--no-first-run',
     ],
   });
-  const relay = new ExtensionRelay();
+  const relay = new ExtensionRelay({ pairingToken: EXT_TEST_TOKEN });
   try {
     await relay.listen(DEFAULT_EXTENSION_RELAY_PORT);
+    await seedPairingToken(ctx, EXT_TEST_TOKEN);
     await relay.waitForPeer(opts.peerTimeoutMs);
     return { ctx, relay };
   } catch {

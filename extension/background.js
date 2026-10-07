@@ -18,6 +18,11 @@ const OP_TIMEOUT_MS = 20000;
 
 let ws = null;
 let wsUrl = DEFAULT_WS_URL;
+// Guard against concurrent connect() calls racing through the async config
+// read: connect() awaits chrome.storage, so two overlapping calls would both
+// pass the readyState check and open duplicate sockets (the relay drops the
+// older peer, killing in-flight ops). The flag is set synchronously.
+let connectPending = false;
 let reconnectDelay = RECONNECT_BASE_MS;
 let lastError = null;
 let connectedAt = null;
@@ -57,6 +62,18 @@ const PAGE_OPS = new Set([
 async function getWsUrl() {
   const { wsUrl: saved } = await chrome.storage.local.get('wsUrl');
   return saved || DEFAULT_WS_URL;
+}
+
+async function getPairingToken() {
+  const { pairingToken: saved } = await chrome.storage.local.get('pairingToken');
+  return String(saved || '');
+}
+
+/** Base relay URL + pairing token (sent as ?token=; the relay rejects unpaired sockets). */
+async function getConnInfo() {
+  const base = await getWsUrl();
+  const token = await getPairingToken();
+  return { base, token, url: token ? `${base}?token=${encodeURIComponent(token)}` : base };
 }
 
 function tabInfo(tab) {
@@ -178,18 +195,30 @@ async function handleOp(op, params) {
   throw new Error(`unknown extension op "${op}"`);
 }
 
-function connect() {
+async function connect() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  if (connectPending) return;
+  connectPending = true;
   lastError = null;
   let socket;
   try {
-    socket = new WebSocket(wsUrl);
-  } catch (err) {
-    lastError = String(err && err.message || err);
-    scheduleReconnect();
-    return;
+    // Read fresh config every attempt: the pairing token may have been saved
+    // via the popup after a previous unauthenticated attempt.
+    const info = await getConnInfo();
+    // Re-check after the await: another connect path may have won the race.
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+    wsUrl = info.base;
+    try {
+      socket = new WebSocket(info.url);
+    } catch (err) {
+      lastError = String(err && err.message || err);
+      scheduleReconnect();
+      return;
+    }
+    ws = socket;
+  } finally {
+    connectPending = false;
   }
-  ws = socket;
   socket.onopen = () => {
     connectedAt = new Date().toISOString();
     reconnectDelay = RECONNECT_BASE_MS;
@@ -234,6 +263,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return {
         connected: !!ws && ws.readyState === WebSocket.OPEN,
         wsUrl, connectedAt, lastError,
+        pairingSet: !!(await getPairingToken()),
       };
     }
     if (msg.type === 'setWsUrl') {
@@ -244,8 +274,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       await chrome.storage.local.set({ wsUrl: url });
       wsUrl = url;
       if (ws) ws.close();
-      connect();
+      void connect();
       return { wsUrl };
+    }
+    if (msg.type === 'setPairingToken') {
+      const token = String(msg.pairingToken || '').trim();
+      if (token && !/^[0-9a-fA-F]{16,128}$/.test(token)) {
+        throw new Error('pairing token looks invalid (expected hex)');
+      }
+      await chrome.storage.local.set({ pairingToken: token });
+      if (ws) ws.close();
+      void connect();
+      return { saved: true };
     }
     throw new Error(`unknown message "${msg.type}"`);
   })().then(
@@ -255,8 +295,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   return true;
 });
 
-chrome.runtime.onInstalled.addListener(() => { void getWsUrl().then((u) => { wsUrl = u; connect(); }); });
-chrome.runtime.onStartup.addListener(() => { void getWsUrl().then((u) => { wsUrl = u; connect(); }); });
+chrome.runtime.onInstalled.addListener(() => { void connect(); });
+chrome.runtime.onStartup.addListener(() => { void connect(); });
 // A navigation invalidates content-script readiness; the script re-announces
 // on the new page.
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
@@ -264,4 +304,4 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 });
 chrome.tabs.onRemoved.addListener((tabId) => { readyTabs.delete(tabId); });
 // Service workers can start without the events above in some flows; connect eagerly.
-void getWsUrl().then((u) => { wsUrl = u; connect(); });
+void connect();

@@ -213,6 +213,16 @@ export interface BrowserStartOptions {
   headless: boolean;
   viewport?: { width: number; height: number };
   navigationTimeoutMs?: number;
+  /**
+   * ExtensionBackend only: TCP port of the extension relay WebSocket
+   * (default 8932). Ignored by the Playwright/CDP backends.
+   */
+  extensionRelayPort?: number;
+  /**
+   * Optional egress proxy, e.g. `{ server: 'http://proxy:8080' }`.
+   * Playwright only (Chromium does not read proxy env vars reliably).
+   */
+  proxy?: { server: string; username?: string; password?: string };
 }
 
 /** Options for attaching to an existing user browser over CDP. */

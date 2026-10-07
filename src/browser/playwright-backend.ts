@@ -19,7 +19,10 @@ export class PlaywrightBackend extends PageBackendBase {
   async start(opts: BrowserStartOptions): Promise<void> {
     if (this.browser) return;
     this.navigationTimeoutMs = opts.navigationTimeoutMs ?? 30_000;
-    this.browser = await chromium.launch({ headless: opts.headless });
+    this.browser = await chromium.launch({
+      headless: opts.headless,
+      ...(opts.proxy ? { proxy: opts.proxy } : {}),
+    });
     this.context = await this.browser.newContext({
       viewport: opts.viewport ?? { width: 1280, height: 800 },
       acceptDownloads: true,

@@ -47,9 +47,15 @@ An agent can't click what it can't see. This bridge gives it eyes and hands:
                     ┌──────────────▼──────────────┐
                     │  BrowserBackend             │
                     │  ├── PlaywrightBackend      │  launched isolated Chromium
-                    │  └── CdpBackend             │  user's Chrome/Edge over CDP
+                    │  ├── CdpBackend             │  user's Chrome/Edge over CDP
+                    │  └── ExtensionBackend       │  user's Chrome via MV3 extension (docs/EXTENSION.md)
                     └─────────────────────────────┘
   AgentLoop: OBSERVE → PLAN → CHECK(policy) → ACT → VERIFY → recover (≤1 retry)
+
+  MCP server: `node dist/src/index.js mcp --transport stdio|http` exposes the
+  30 bridge tools over MCP (stdio for local clients, Streamable HTTP on
+  127.0.0.1:8933 for remote). HTTP requires a bearer token when not
+  loopback-bound. See docs/MCP_CHATGPT.md (incl. ChatGPT plan limits).
 ```
 
 Key modules: `src/browser/` (backends, snapshot walker), `src/perception/`
@@ -148,20 +154,26 @@ node dist/src/index.js agent --resume task-xxxxxxxx
 ## Limitations (honest)
 
 - **Closed shadow DOM is not accessible** — a hard browser boundary, not a bug.
-- **Visual grounding is partial.** Screenshots are captured and attached to
-  task state, but there is no vision model mapping pixels to grounded
-  candidates yet; when DOM grounding is insufficient the agent re-observes
-  via snapshot. Do not rely on pixel-level control.
-- **Existing-browser connection is CDP-based**, not an extension: you must
-  start Chrome/Edge with `--remote-debugging-port` yourself. No extension is
-  shipped in v1.
+- **Visual grounding is coordinate-based, not a vision model.**
+  `src/perception/visual.ts` maps viewport (x, y) to DOM refs via
+  `elementFromPoint` (extension content script or Playwright) and
+  `regionToCandidates` via bounding-box intersection. It resolves points to
+  refs reliably, but there is no image understanding — do not expect it to
+  find things by appearance.
+- **Extension backend is top-frame-only in v1**, has no file uploads and no
+  download tracking, and dispatches synthetic DOM events (not trusted
+  OS-level input). See `docs/EXTENSION.md`. CDP attach (`CdpBackend`) is
+  still available for existing browsers started with
+  `--remote-debugging-port`.
 - **Verification is best-effort.** Actions without a reliable observable
   signal (hover, scroll) are reported as *unverified*, never faked. The loop
   records this honestly for the planner.
 - **No CAPTCHA solving, no bot-detection evasion, no auth bypass** — out of
   scope, documented as future work.
 - **Single-user, single-machine.** No multi-user auth on the bridge itself;
-  anyone who can reach localhost can drive it — keep it on loopback.
+  anyone who can reach localhost can drive it — keep it on loopback. The
+  MCP HTTP transport additionally requires a bearer token whenever it is
+  not loopback-bound (see `docs/MCP_CHATGPT.md`).
 - **The LLM provider is required for autonomous runs** and is the only
   network call the agent makes; everything else is local and deterministic.
 
@@ -169,15 +181,18 @@ node dist/src/index.js agent --resume task-xxxxxxxx
 
 ```
 src/
-  browser/       backends (playwright/cdp), snapshot walker, tab/frame logic
-  perception/    grounding.ts — stale detection + semantic re-grounding
+  browser/       backends (playwright/cdp/extension), relay, factory, snapshot walker, tab/frame logic
+  perception/    grounding.ts — stale detection + semantic re-grounding; visual.ts — coordinate grounding
+  mcp/           server.ts — MCP server (stdio + Streamable HTTP, bearer auth)
   agent/         agent-loop.ts, verifier.ts
   security/      policy.ts, confirm.ts, redact.ts, injection.ts
   state/         task-store.ts — JSON task persistence + resume
   server.ts      JSON-RPC/SSE server + /ui + /api
   tools.ts       30 browser_* tool definitions
-  index.ts       CLI: serve|demo|agent|approve|status|doctor|tasks
-tests/           unit (mock) + real headless Chromium + real CDP attach
+  index.ts       CLI: serve|mcp|demo|agent|approve|status|doctor|tasks
+extension/       Chrome MV3 extension (service worker + content script + popup)
+docs/            EXTENSION.md, MCP_CHATGPT.md, ACCEPTANCE.md
+tests/           unit (mock) + real headless Chromium + real CDP attach + MCP protocol + visual
 tests/fixtures/  deterministic fixture pages (forms, frames, shadow DOM,
                  delayed/stale elements, upload, download, injection)
 docs/ACCEPTANCE.md  acceptance suite A–P mapped to tests and evidence

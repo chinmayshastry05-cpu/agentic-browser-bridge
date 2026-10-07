@@ -13,6 +13,8 @@ import { AgentLoop } from './agent/agent-loop.js';
 import { BrowserSession } from './bridge-core.js';
 import { createProviderFromEnv } from './openai.js';
 import { BridgeServer } from './server.js';
+import { buildMcpServer, startMcpServer } from './mcp/server.js';
+import { parseBackendName, createBackend } from './browser/factory.js';
 import { PolicyEngine } from './security/policy.js';
 import { ConfirmationQueue } from './security/confirm.js';
 import { TaskStore } from './state/task-store.js';
@@ -27,11 +29,64 @@ function argValue(args: string[], name: string): string | undefined {
   return i >= 0 ? args[i + 1] : undefined;
 }
 
+/**
+ * `node dist/index.js mcp --transport stdio|http [--port N] [--host H] [--public] [--headed]`
+ *
+ * Starts a real MCP server (Model Context Protocol) exposing the bridge
+ * tools. stdio is for local MCP clients; Streamable HTTP is for remote
+ * clients (e.g. ChatGPT developer mode). The HTTP transport binds 127.0.0.1
+ * by default and REQUIRES a bearer token when bound non-locally or with
+ * --public. Tool calls go through the same PolicyEngine as the local loop.
+ */
+async function cmdMcp(args: string[]): Promise<void> {
+  const transport = argValue(args, '--transport') ?? 'stdio';
+  if (transport !== 'stdio' && transport !== 'http') {
+    console.error('usage: node dist/index.js mcp --transport stdio|http [--port N] [--host H] [--public] [--headed]');
+    process.exit(2);
+  }
+  const port = Number(argValue(args, '--port') ?? process.env['ABB_MCP_PORT'] ?? 8933);
+  const host = argValue(args, '--host') ?? process.env['ABB_MCP_HOST'] ?? '127.0.0.1';
+  const public_ = args.includes('--public');
+  const backend = parseBackendName(argValue(args, '--backend') ?? process.env['ABB_BACKEND']);
+
+  const session = new BrowserSession('mcp', createBackend(backend));
+  await session.start({ headless: !args.includes('--headed') });
+  const server = buildMcpServer(session, { policy: new PolicyEngine() });
+  const handle = await startMcpServer(server, {
+    transport: transport as 'stdio' | 'http',
+    host,
+    port,
+    public: public_,
+  });
+
+  if (transport === 'stdio') {
+    console.error('[agentic-browser-bridge] MCP stdio transport ready (speak MCP on stdin/stdout)');
+  } else {
+    console.log(`[agentic-browser-bridge] MCP Streamable HTTP ready at ${handle.url}`);
+    if (handle.token) {
+      console.log('[agentic-browser-bridge] bearer auth REQUIRED — the token was printed once to stderr above');
+    } else {
+      console.log('[agentic-browser-bridge] loopback bind without --public: no bearer token required');
+    }
+  }
+
+  const shutdown = async (): Promise<void> => {
+    console.error('\n[agentic-browser-bridge] shutting down MCP server...');
+    await handle.close();
+    await session.close();
+    process.exit(0);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+  await new Promise<void>(() => undefined); // run until signal
+}
+
 async function cmdServe(args: string[]): Promise<void> {
   const port = Number(argValue(args, '--port') ?? process.env['ABB_PORT'] ?? 8931);
   const host = argValue(args, '--host') ?? process.env['ABB_HOST'] ?? '127.0.0.1';
   const headless = !args.includes('--headed');
-  const server = new BridgeServer({ host, port, headless });
+  const backend = parseBackendName(argValue(args, '--backend') ?? process.env['ABB_BACKEND']);
+  const server = new BridgeServer({ host, port, headless, backend });
   const addr = await server.listen();
   console.log(`[agentic-browser-bridge] listening on http://${addr.host}:${addr.port}`);
   console.log(`[agentic-browser-bridge] ui:      GET /ui`);
@@ -57,7 +112,8 @@ async function cmdAgent(args: string[]): Promise<void> {
     process.exit(2);
   }
   const maxSteps = Number(argValue(args, '--max-steps') ?? '12');
-  const session = new BrowserSession('agent-cli');
+  const backend = parseBackendName(argValue(args, '--backend') ?? process.env['ABB_BACKEND']);
+  const session = new BrowserSession('agent-cli', createBackend(backend));
   await session.start({ headless: !args.includes('--headed') });
   try {
     const provider = createProviderFromEnv();
@@ -253,6 +309,9 @@ async function main(): Promise<void> {
     case 'serve':
       await cmdServe(args);
       break;
+    case 'mcp':
+      await cmdMcp(args);
+      break;
     case 'demo':
       await runDemo();
       break;
@@ -274,9 +333,13 @@ async function main(): Promise<void> {
     default:
       console.log('agentic-browser-bridge — original local MCP browser bridge');
       console.log('');
-      console.log('  serve [--port N] [--host H] [--headed]   start the bridge server');
+      console.log('  serve [--port N] [--host H] [--headed] [--backend playwright|extension]');
+      console.log('                                           start the bridge server');
+      console.log('  mcp --transport stdio|http [--port N] [--host H] [--public] [--headed] [--backend playwright|extension]');
+      console.log('                                           start the MCP server (stdio or Streamable HTTP)');
       console.log('  demo                                     run the local end-to-end demo');
-      console.log('  agent --goal "..." [--max-steps N]       run the agent loop (needs OPENAI_API_KEY)');
+      console.log('  agent --goal "..." [--max-steps N] [--backend playwright|extension]');
+      console.log('                                           run the agent loop (needs OPENAI_API_KEY)');
       console.log('  agent --resume <taskId>                  resume an interrupted task');
       console.log('  approve <confirmation-id> --yes|--no     approve/reject a pending high-risk action');
       console.log('  status                                   show bridge status (tasks, confirmations)');

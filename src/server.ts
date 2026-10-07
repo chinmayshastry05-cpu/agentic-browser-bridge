@@ -19,6 +19,7 @@
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import { URL } from 'node:url';
 import { BrowserSession, SessionManager } from './bridge-core.js';
+import { createBackend, type BackendName } from './browser/factory.js';
 import { createToolRegistry } from './tools.js';
 import { TaskStore } from './state/task-store.js';
 import { ConfirmationQueue } from './security/confirm.js';
@@ -29,6 +30,8 @@ export interface ServerOptions {
   port?: number;
   maxSessions?: number;
   headless?: boolean;
+  /** 'playwright' (default) or 'extension'. CDP attaches via the API, not serve. */
+  backend?: BackendName;
 }
 
 type EventListener = (event: string, data: unknown) => void;
@@ -47,6 +50,7 @@ export class BridgeServer {
       port: opts.port ?? 8931,
       maxSessions: opts.maxSessions ?? 4,
       headless: opts.headless ?? true,
+      backend: opts.backend ?? 'playwright',
     };
     this.sessions = new SessionManager(this.opts.maxSessions);
   }
@@ -86,7 +90,7 @@ export class BridgeServer {
       const params = req.params ?? {};
       switch (req.method) {
         case 'session/create': {
-          const session = this.sessions.create();
+          const session = this.sessions.create(createBackend(this.opts.backend));
           await session.start({ headless: (params['headless'] as boolean) ?? this.opts.headless });
           this.emit(session.id, 'session.created', { sessionId: session.id });
           return ok(req.id, { sessionId: session.id });

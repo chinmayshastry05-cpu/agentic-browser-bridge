@@ -26,3 +26,5 @@ Thumbs.db
 # logs
 *.log
 npm-debug.log*
+.abb-downloads/
+demo/output/*.png

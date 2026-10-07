@@ -10,7 +10,7 @@ import { BrowserSession, SessionManager } from '../src/bridge-core.js';
 import { analyze, findByName, findByRole, rankInteractables } from '../src/analyzer.js';
 import { buildTree, findNode, flatten, renderTree } from '../src/tree.js';
 import { OpenAIAdapter } from '../src/openai.js';
-import { AgentLoop } from '../src/agent-loop.js';
+import { AgentLoop } from '../src/agent/agent-loop.js';
 import { createToolRegistry, listToolDefinitions } from '../src/tools.js';
 import { BridgeServer } from '../src/server.js';
 import type {
@@ -105,22 +105,34 @@ class MockBackend implements BrowserBackend {
     this.snapshotCounter += 1;
     return { ...this.snapshotData, snapshotId: `snap-mock-${this.snapshotCounter}` };
   }
-  async click(selector: string, _frameId?: string): Promise<void> { this.clicked.push(selector); }
+  async click(selector: string, _frameId?: string): Promise<void> {
+    if (this.nextClickError) {
+      const e = this.nextClickError;
+      this.nextClickError = null;
+      throw new Error(e);
+    }
+    this.clicked.push(selector);
+  }
+  /** Set to make the next click() throw (recovery tests). */
+  nextClickError: string | null = null;
   async dblclick(selector: string, _frameId?: string): Promise<void> { this.clicked.push(`dbl:${selector}`); }
   async type(selector: string, text: string, submit: boolean, _frameId?: string): Promise<void> {
     this.typed.push({ selector, text, submit });
+    this.fieldValues[selector] = text;
   }
-  async clear(selector: string, _frameId?: string): Promise<void> { this.typed.push({ selector, text: '', submit: false }); }
+  async clear(selector: string, _frameId?: string): Promise<void> { this.typed.push({ selector, text: '', submit: false }); this.fieldValues[selector] = ''; }
   async pressKey(key: string, _frameId?: string): Promise<void> { this.typed.push({ selector: '<keyboard>', text: key, submit: false }); }
   async hover(selector: string, _frameId?: string): Promise<void> { this.clicked.push(`hover:${selector}`); }
   async focus(selector: string, _frameId?: string): Promise<void> { this.clicked.push(`focus:${selector}`); }
   async scrollIntoView(selector: string, _frameId?: string): Promise<void> { this.clicked.push(`scrollto:${selector}`); }
   async selectOption(selector: string, values: string[], _frameId?: string): Promise<string[]> {
     this.typed.push({ selector, text: values.join(','), submit: false });
+    this.fieldValues[selector] = values[0] ?? '';
     return values;
   }
   async setChecked(selector: string, checked: boolean, _frameId?: string): Promise<void> {
     this.typed.push({ selector, text: checked ? 'checked' : 'unchecked', submit: false });
+    this.fieldChecked[selector] = checked;
   }
   async scrollBy(_dx: number, _dy: number): Promise<void> { /* noop */ }
   async waitForSelector(_selector: string, _state: 'visible' | 'hidden' | 'attached', _timeoutMs: number, _frameId?: string): Promise<void> { /* noop */ }
@@ -134,12 +146,22 @@ class MockBackend implements BrowserBackend {
   async frameSnapshot(_frameId: string): Promise<PageSnapshot> { throw new Error('no frames in mock'); }
   /** Override per-test to simulate DOM drift; default mirrors the last snapshot. */
   describeOverride: Record<string, TargetDescription | null> | null = null;
+  fieldValues: Record<string, string> = {};
+  fieldChecked: Record<string, boolean> = {};
   async describeTarget(selector: string, _frameId?: string): Promise<TargetDescription | null> {
     if (this.describeOverride && selector in this.describeOverride) {
       return this.describeOverride[selector];
     }
     const n = this.snapshotData.nodes.find((x) => x.selector === selector);
-    return n ? { role: n.role, name: n.name, tag: n.tag, visible: n.visible } : null;
+    if (!n) return null;
+    return {
+      role: n.role,
+      name: n.name,
+      tag: n.tag,
+      visible: n.visible,
+      value: this.fieldValues[selector] ?? n.text,
+      checked: this.fieldChecked[selector],
+    };
   }
   async uploadFile(selector: string, filePath: string, _frameId?: string): Promise<void> {
     this.typed.push({ selector, text: `upload:${filePath}`, submit: false });
@@ -681,6 +703,124 @@ describe('session resolveTarget (stale detection)', () => {
     };
     await expect(session.click('e3')).rejects.toThrow(/stale element ref/);
     expect(backend.clicked).toEqual([]);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* agent/verifier.ts + loop recovery and terminal states (M4)          */
+/* ------------------------------------------------------------------ */
+
+import { verifyAction } from '../src/agent/verifier.js';
+
+describe('verifier', () => {
+  it('verifies navigate by URL match', async () => {
+    const { session } = makeSession();
+    const v = await verifyAction(session, { action: 'navigate', url: 'https://example.test/' }, '');
+    expect(v.verified).toBe(true);
+    expect(v.method).toBe('url-match');
+
+    const bad = await verifyAction(session, { action: 'navigate', url: 'https://other.test/' }, '');
+    expect(bad.verified).toBe(false);
+  });
+
+  it('verifies type by field value', async () => {
+    const { session } = makeSession();
+    await session.snapshot();
+    await session.type('e2', 'Ada');
+    const v = await verifyAction(session, { action: 'type', ref: 'e2', text: 'Ada' }, session.url);
+    expect(v.verified).toBe(true);
+    expect(v.method).toBe('field-value');
+
+    const bad = await verifyAction(session, { action: 'type', ref: 'e2', text: 'Zed' }, session.url);
+    expect(bad.verified).toBe(false);
+  });
+
+  it('verifies check by checked state', async () => {
+    const { session, backend } = makeSession();
+    backend.fieldChecked['#e3'] = true;
+    await session.snapshot();
+    const v = await verifyAction(session, { action: 'check', ref: 'e3', checked: true }, session.url);
+    expect(v.verified).toBe(true);
+  });
+
+  it('reports click honestly when nothing observable changed', async () => {
+    const { session } = makeSession();
+    await session.snapshot();
+    const v = await verifyAction(session, { action: 'click', ref: 'e3' }, session.url);
+    expect(v.verified).toBe(false);
+    expect(v.detail).toMatch(/no navigation/i);
+  });
+});
+
+describe('agent loop recovery and terminal states', () => {
+  it('retries once after a stale failure, then verifies', async () => {
+    const { session, backend } = makeSession();
+    backend.nextClickError = 'stale element ref "e3" (simulated)';
+    const provider = scriptedProvider([
+      JSON.stringify({ action: 'click', ref: 'e3', reason: 'press it' }),
+      JSON.stringify({ action: 'finish', result: 'done' }),
+    ]);
+    const loop = new AgentLoop(session, provider, { maxSteps: 5 });
+    const trace = await loop.run('press the button');
+    expect(trace.status).toBe('completed');
+    expect(trace.steps[0]!.recoveryAttempts).toBe(1);
+    expect(trace.steps[0]!.result.ok).toBe(true);
+    expect(backend.clicked).toEqual(['#e3']);
+  });
+
+  it('stops after one failed retry (bounded, no infinite loop)', async () => {
+    const { session, backend } = makeSession();
+    // MockBackend.click only fails once via nextClickError; simulate a
+    // persistent failure by failing describeTarget instead: every action
+    // attempt throws a fatal error through a poisoned backend method.
+    backend.click = async () => {
+      throw new Error('fatal: element is not clickable at point');
+    };
+    const provider = scriptedProvider([JSON.stringify({ action: 'click', ref: 'e3' })]);
+    const loop = new AgentLoop(session, provider, { maxSteps: 2 });
+    const trace = await loop.run('press the button');
+    expect(trace.steps).toHaveLength(2);
+    expect(trace.steps[0]!.recoveryAttempts).toBe(0); // fatal: no retry
+    expect(trace.steps[0]!.result.ok).toBe(false);
+    expect(trace.status).toBe('failed');
+    expect(trace.finishReason).toMatch(/maxSteps/);
+  });
+
+  it('enters awaiting_confirmation when the policy gate requires it', async () => {
+    const { session } = makeSession();
+    const provider = scriptedProvider([JSON.stringify({ action: 'click', ref: 'e3' })]);
+    const loop = new AgentLoop(session, provider, {
+      maxSteps: 5,
+      policyCheck: async () => ({ confirm: 'clicking might submit a form — approve?' }),
+    });
+    const trace = await loop.run('do the thing');
+    expect(trace.status).toBe('awaiting_confirmation');
+    expect(trace.finishReason).toMatch(/requires confirmation/);
+  });
+
+  it('enters blocked when the policy gate denies', async () => {
+    const { session } = makeSession();
+    const provider = scriptedProvider([JSON.stringify({ action: 'click', ref: 'e3' })]);
+    const loop = new AgentLoop(session, provider, {
+      maxSteps: 5,
+      policyCheck: async () => ({ deny: 'clicking is disabled in this context' }),
+    });
+    const trace = await loop.run('do the thing');
+    expect(trace.status).toBe('blocked');
+    expect(trace.finishReason).toMatch(/denied by policy/);
+  });
+
+  it('records verification on successful steps', async () => {
+    const { session } = makeSession();
+    const provider = scriptedProvider([
+      JSON.stringify({ action: 'type', ref: 'e2', text: 'Ada', reason: 'fill name' }),
+      JSON.stringify({ action: 'finish', result: 'filled' }),
+    ]);
+    const loop = new AgentLoop(session, provider, { maxSteps: 5 });
+    const trace = await loop.run('fill the name');
+    expect(trace.status).toBe('completed');
+    expect(trace.steps[0]!.verification?.verified).toBe(true);
+    expect(trace.steps[0]!.verification?.method).toBe('field-value');
   });
 });
 

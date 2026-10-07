@@ -264,8 +264,20 @@ export class BrowserSession {
     await this.backend.waitForSelector(selector, state, timeoutMs);
   }
 
-  async pageText(ref?: string): Promise<string> {
-    if (!ref) return this.backend.pageText();
+  /**
+   * Resolve a ref and describe the live element behind it. Null when the
+   * target is gone or cannot be grounded — used by the verifier.
+   */
+  async describeLiveTarget(ref: string): Promise<import('./types.js').TargetDescription | null> {
+    try {
+      const t = await this.resolveTarget(ref);
+      return await this.backend.describeTarget(t.selector, t.frameId);
+    } catch {
+      return null;
+    }
+  }
+
+  async pageText(ref?: string): Promise<string> {    if (!ref) return this.backend.pageText();
     const t = await this.resolveTarget(ref);
     return this.backend.pageText(t.selector, t.frameId);
   }

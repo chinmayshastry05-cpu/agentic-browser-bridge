@@ -222,8 +222,7 @@ describe('M2 browser tool surface (real headless Chromium)', () => {
     }
   }, 60_000);
 
-  it('re-grounds a stale ref after the element is replaced', async () => {
-    const session = await makeSession();
+  it('re-grounds a stale ref after the element is replaced', async () => {    const session = await makeSession();
     try {
       const swapRef = refByName(session, 'Swap me');
       await session.click(swapRef); // replaces the button node (new selector)
@@ -240,4 +239,45 @@ describe('M2 browser tool surface (real headless Chromium)', () => {
       await session.close();
     }
   }, 60_000);
+
+  it('runs the full observe->plan->act->verify loop against the fixture', async () => {
+    const { AgentLoop } = await import('../src/agent/agent-loop.js');
+    const session = await makeSession();
+    try {
+      // Scripted planner (no LLM key): fill the name, greet, finish.
+      const script = [
+        JSON.stringify({ action: 'snapshot', reason: 'observe' }),
+        JSON.stringify({ action: 'type', ref: '__NAME__', text: 'Ada', reason: 'fill name' }),
+        JSON.stringify({ action: 'click', ref: '__GREET__', reason: 'submit greeting' }),
+        JSON.stringify({ action: 'finish', result: 'greeting shown' }),
+      ];
+      let i = 0;
+      const provider = {
+        name: 'scripted-e2e',
+        complete: async (_messages: unknown) => {
+          const raw = script[Math.min(i, script.length - 1)];
+          i += 1;
+          // Resolve refs from the latest snapshot dynamically.
+          const snap = (
+            session as unknown as { lastSnapshot: import('../src/types.js').PageSnapshot | null }
+          ).lastSnapshot;
+          const find = (part: string, role?: string) =>
+            snap?.nodes.find((n) => (!role || n.role === role) && n.name.includes(part))?.ref ?? 'e999';
+          return (raw as string)
+            .replace('__NAME__', find('e.g. Ada', 'textbox'))
+            .replace('__GREET__', find('Greet me', 'button'));
+        },
+      };
+      const loop = new AgentLoop(session, provider, { maxSteps: 6 });
+      const trace = await loop.run('fill the name field with Ada and trigger the greeting');
+      expect(trace.status).toBe('completed');
+      expect(trace.steps.length).toBeGreaterThanOrEqual(3);
+      // The type step must have been verified by field value.
+      const typeStep = trace.steps.find((s) => s.action.action === 'type');
+      expect(typeStep?.verification?.verified).toBe(true);
+      expect(await session.pageText()).toContain('Hello, Ada!');
+    } finally {
+      await session.close();
+    }
+  }, 90_000);
 });

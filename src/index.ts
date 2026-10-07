@@ -9,7 +9,7 @@
  * local end-to-end demo; `agent` runs one autonomous observe->plan->act loop
  * against a goal (needs OPENAI_API_KEY or another configured provider).
  */
-import { AgentLoop } from './agent-loop.js';
+import { AgentLoop } from './agent/agent-loop.js';
 import { BrowserSession } from './bridge-core.js';
 import { createProviderFromEnv } from './openai.js';
 import { BridgeServer } from './server.js';

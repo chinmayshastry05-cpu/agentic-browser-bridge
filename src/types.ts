@@ -47,8 +47,18 @@ export interface PageSnapshot {
 /** Actions the agent loop can emit. */
 export type ActionName =
   | 'navigate'
+  | 'back'
+  | 'forward'
+  | 'reload'
   | 'click'
+  | 'double_click'
   | 'type'
+  | 'clear'
+  | 'press_key'
+  | 'select_option'
+  | 'check'
+  | 'scroll'
+  | 'wait_for'
   | 'screenshot'
   | 'snapshot'
   | 'finish'
@@ -56,7 +66,7 @@ export type ActionName =
 
 export interface AgentAction {
   action: ActionName;
-  /** Element ref for click/type. */
+  /** Element ref for click/type/... */
   ref?: string;
   /** URL for navigate. */
   url?: string;
@@ -64,11 +74,38 @@ export interface AgentAction {
   text?: string;
   /** Optional submit (press Enter) after typing. */
   submit?: boolean;
+  /** Key for press_key, e.g. "Enter". */
+  key?: string;
+  /** Values for select_option. */
+  values?: string[];
+  /** Desired state for check. */
+  checked?: boolean;
+  /** Scroll delta for scroll. */
+  dx?: number;
+  dy?: number;
+  /** CSS selector for wait_for. */
+  selector?: string;
   /** Free-text rationale from the planner. */
   reason?: string;
   /** Set by the planner when the goal is achieved. */
   result?: string;
 }
+
+/** Outcome of verifying an action's effect on the page. */
+export interface ActionVerification {
+  verified: boolean;
+  /** How verification was performed, e.g. "url-match", "field-value". */
+  method: string;
+  detail: string;
+}
+
+/** Terminal states of an agent run. */
+export type AgentStatus =
+  | 'completed'
+  | 'failed'
+  | 'blocked'
+  | 'awaiting_confirmation'
+  | 'awaiting_user_input';
 
 /** Outcome of a single tool call or agent step. */
 export interface ToolResult {
@@ -82,6 +119,10 @@ export interface StepRecord {
   step: number;
   action: AgentAction;
   result: ToolResult;
+  /** What verification of the action's effect found (when applicable). */
+  verification?: ActionVerification;
+  /** How many recovery retries this step needed. */
+  recoveryAttempts?: number;
   startedAt: string;
   finishedAt: string;
 }
@@ -91,6 +132,7 @@ export interface AgentTrace {
   goal: string;
   steps: StepRecord[];
   finished: boolean;
+  status: AgentStatus;
   finishReason?: string;
   startedAt: string;
   finishedAt: string;
@@ -186,6 +228,10 @@ export interface TargetDescription {
   name: string;
   tag: string;
   visible: boolean;
+  /** Current value for input/textarea/select (when readable). */
+  value?: string;
+  /** Checked state for checkbox/radio/switch (when applicable). */
+  checked?: boolean;
 }
 
 /**

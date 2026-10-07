@@ -511,7 +511,14 @@ export abstract class PageBackendBase implements BrowserBackend {
         }
         const rect = el.getBoundingClientRect();
         const style = window.getComputedStyle(el);
-        return {
+        const out: {
+          role: string;
+          name: string;
+          tag: string;
+          visible: boolean;
+          value?: string;
+          checked?: boolean;
+        } = {
           role,
           name,
           tag,
@@ -521,6 +528,19 @@ export abstract class PageBackendBase implements BrowserBackend {
             style.visibility !== 'hidden' &&
             style.display !== 'none',
         };
+        if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+          out.value = (el.value ?? '').slice(0, 500);
+        }
+        if (el instanceof HTMLSelectElement) {
+          out.value = (el.value ?? '').slice(0, 500);
+        }
+        if (el instanceof HTMLInputElement && (el.type === 'checkbox' || el.type === 'radio')) {
+          out.checked = el.checked;
+        }
+        if (el.getAttribute('role') === 'checkbox' || el.getAttribute('role') === 'switch') {
+          out.checked = el.getAttribute('aria-checked') === 'true';
+        }
+        return out;
       });
     } catch {
       return null;

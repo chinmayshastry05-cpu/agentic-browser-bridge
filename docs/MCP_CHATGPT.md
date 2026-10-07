@@ -70,6 +70,13 @@ see below), `--headed` (visible browser), `--backend playwright|extension`
 - **Fail closed:** if ChatGPT is configured with "No authentication", its
   requests get **401** with a message pointing at the OAuth setup.
   Unauthenticated browser control is never allowed.
+- **Consequential clicks need approval:** `browser_click` /
+  `browser_double_click` resolve the target's accessible name and require
+  a human confirmation ticket when the label matches a tight keyword set
+  (buy, purchase, pay, checkout, place order, subscribe, delete, remove,
+  transfer, withdraw, send money). This is heuristic TEXT matching, not
+  semantic understanding — icon-only buttons with no accessible name are
+  NOT caught.
 
 Port map: `8931` bridge HTTP · `8932` extension relay WS · `8933` MCP
 Streamable HTTP.
@@ -96,13 +103,15 @@ ChatGPT → Plugins → Add offers **"Add custom MCP server"**. Its
 authentication selector offers ONLY: **OAuth**, **No authentication**,
 **"OAuth or no authentication"** — there is no Bearer/API-key field.
 
-1. Start the bridge (note the pairing code printed to the terminal):
+1. Start the tunnel FIRST (it retries against the closed port — that is
+   fine): `cloudflared tunnel --url http://localhost:8933`
+   Copy the `https://<random>.trycloudflare.com` URL it prints.
+2. Start the bridge with that URL as the issuer (note the pairing code
+   printed to the terminal):
    `node dist/src/index.js mcp --transport http --port 8933 --issuer https://<random>.trycloudflare.com`
    (`--issuer` is required: without it, discovery hands ChatGPT loopback
-   auth URLs it can never reach.)
-2. Start the tunnel: `cloudflared tunnel --url http://localhost:8933`
-   (note the `https://<random>.trycloudflare.com` URL — it must match
-   the `--issuer` from step 1).
+   auth URLs it can never reach. `ABB_PUBLIC_URL` env works too; the flag
+   wins.)
 3. In ChatGPT: Plugins → Add → "Add custom MCP server" → paste
    `https://<random>.trycloudflare.com/mcp` → authentication: **OAuth**.
 4. ChatGPT opens the bridge's `/authorize` page: enter the pairing code
@@ -111,17 +120,19 @@ authentication selector offers ONLY: **OAuth**, **No authentication**,
    tools. Done — no API key, no paid upgrade, no LLM key anywhere.
 
 Restarting: the tunnel URL changes on every `cloudflared` restart, so
-repeat steps 2–3 with the new URL. The pairing code is per server start;
-restarting the bridge prints a new one.
+start the tunnel first, copy the new URL, then restart the bridge with
+`--issuer <new-url>` and re-register in ChatGPT. The pairing code is per
+server start; restarting the bridge prints a new one.
 
-## What ChatGPT can actually do (verified, Oct 2026)
+## What ChatGPT can actually do (reviewer-verified, Oct 2026)
 
-- Read/write capability through ChatGPT is **empirically untested** and
-  will be verified with real ChatGPT tool calls; no claim is made either
-  way.
-- The bridge's own local agent loop performs browser write actions on
-  this machine regardless; whether ChatGPT can do the same through the
-  MCP server is part of what the real tool-call verification will check.
+Proven end-to-end by independent review (not a claim — observed): real
+ChatGPT Go account (`chinmayshastry05@gmail.com`) custom MCP via OAuth,
+GPT drove `snapshot` / `type` / `click` / `gettext` on a fresh real MV3
+Chromium fixture, plus a real confirmation-ticket approval flow
+(`confirm-3baaca76`). No API key, no paid upgrade. Scope of the proof:
+the local fixture only — behavior on arbitrary public websites is NOT
+covered by this verification.
 
 ## Tool list
 

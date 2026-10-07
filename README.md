@@ -2,8 +2,8 @@
 
 A local-first **browser agent bridge**: an AI agent observes a real browser
 session, plans one safe action at a time, verifies the effect, and asks for
-approval before anything consequential — over JSON-RPC + SSE, with a minimal
-local UI.
+approval before the policy engine flags an action high-risk — over JSON-RPC
++ SSE, with a minimal local UI.
 
 > **Originality note:** original implementation written from scratch for this
 > project. No third-party "agentic browser" code is reused.
@@ -27,8 +27,14 @@ An agent can't click what it can't see. This bridge gives it eyes and hands:
 - **Memory** — every run is a persisted task (JSON, `~/.agentic-browser-bridge/tasks/`);
   interrupted tasks resume with `agent --resume <taskId>`. Typed text is
   redacted before anything is written to disk.
-- **Conscience** — a policy engine classifies actions low/medium/high risk;
-  high-risk actions (e.g. typing into password fields) stop the loop with
+- **Conscience** — a policy engine classifies actions low/medium/high risk.
+  Exactly what counts as high risk: typing into password fields, uploads of
+  not-yet-approved files, anything in the operator's `highRiskActions` list,
+  and clicks whose target label matches a tight consequential keyword set
+  (buy, purchase, pay, checkout, place order, subscribe, delete, remove,
+  transfer, withdraw, send money). The keyword check is heuristic TEXT
+  matching on the control's accessible name — icon-only buttons with no
+  accessible name are NOT caught. High-risk actions stop the loop with
   `awaiting_confirmation` until the operator approves via CLI or UI.
 
 ## Architecture

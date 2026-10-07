@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Inner frame</title></head>
+<body>
+  <h2>Frame content</h2>
+  <button id="frame-btn">Frame button</button>
+  <h3 id="frame-out" aria-live="polite"></h3>
+  <script>
+    document.getElementById('frame-btn').addEventListener('click', () => {
+      document.getElementById('frame-out').textContent = 'frame clicked';
+    });
+  </script>
+</body>
+</html>

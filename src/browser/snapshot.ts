@@ -13,7 +13,7 @@
  * Frames: the walk runs in the top frame only. Frame-scoped snapshots are
  * captured separately via captureFrameSnapshot() so refs carry frame context.
  */
-import type { Page } from 'playwright';
+import type { Frame, Page } from 'playwright';
 import { randomUUID } from 'node:crypto';
 import type { DomNode, PageSnapshot } from '../types.js';
 
@@ -51,7 +51,7 @@ export const STRUCTURAL_SELECTOR = [
   'footer',
 ].join(',');
 
-interface RawNode {
+export interface RawNode {
   ref: string;
   role: string;
   name: string;
@@ -70,12 +70,20 @@ interface RawNode {
  * Evaluate the DOM walk in the given root document scope. `scopeLabel` is
  * recorded on each node so refs from frames can be distinguished.
  */
-export async function walkDom(
-  page: Page,
-  scopeLabel?: string,
-): Promise<RawNode[]> {
-  return page.evaluate(
-    ({ interactableSel, structuralSel, refAttr, scopeLabel }) => {
+export interface WalkArgs {
+  interactableSel: string;
+  structuralSel: string;
+  refAttr: string;
+  scopeLabel?: string;
+}
+
+/**
+ * The DOM walker itself. A standalone, serializable function so it can be
+ * evaluated in any document scope: the main frame via Page.evaluate or an
+ * iframe via Frame.evaluate. Runs against `document` of whichever scope it
+ * is evaluated in.
+ */
+export function domWalker({ interactableSel, structuralSel, refAttr, scopeLabel }: WalkArgs): RawNode[] {
       const seen = new WeakSet<Element>();
       const nodes: Array<{
         ref: string;
@@ -100,9 +108,14 @@ export async function walkDom(
       /** Build a unique CSS selector for an element. */
       const uniqueSelector = (el: Element): string => {
         if (el.id) return `#${cssEscape(el.id)}`;
+        // Inside an open shadow root, build the path relative to the shadow
+        // root (parentElement chain stops at the shadow boundary). Playwright's
+        // CSS engine pierces open shadow roots, so this resolves correctly.
+        const inShadow = el.getRootNode() instanceof ShadowRoot;
+        const stop: Element | null = inShadow ? null : document.documentElement;
         const parts: string[] = [];
         let cur: Element | null = el;
-        while (cur && cur !== document.documentElement && parts.length < 8) {
+        while (cur && cur !== stop && parts.length < 8) {
           let part = cur.tagName.toLowerCase();
           const parent: Element | null = cur.parentElement;
           if (parent) {
@@ -135,6 +148,20 @@ export async function walkDom(
           const labels = (el as HTMLInputElement).labels;
           if (labels && labels.length > 0 && labels[0].textContent) {
             return labels[0].textContent.trim().slice(0, 120);
+          }
+        }
+        if (el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) {
+          const labels = (el as HTMLTextAreaElement | HTMLSelectElement).labels;
+          if (labels && labels.length > 0 && labels[0].textContent) {
+            // Use the label's own text nodes, not nested control text.
+            const labelText = Array.from(labels[0].childNodes)
+              .filter((n) => n.nodeType === 3)
+              .map((n) => n.textContent ?? '')
+              .join(' ')
+              .replace(/\s+/g, ' ')
+              .trim();
+            if (labelText) return labelText.slice(0, 120);
+            return (labels[0].textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 120);
           }
         }
         const text = (el.textContent ?? '').replace(/\s+/g, ' ').trim();
@@ -255,13 +282,42 @@ export async function walkDom(
         }
         if (!covered) visit(root, null);
       }
+      // Pierce open shadow roots whose hosts were not themselves visited
+      // (e.g. a plain <div> host). Closed shadow roots are unreachable.
+      const all = document.querySelectorAll('*');
+      for (const el of Array.from(all)) {
+        const shadow = (el as Element).shadowRoot;
+        if (shadow && !seen.has(el)) {
+          seen.add(el);
+          const kids = shadow.querySelectorAll(`${interactableSel},${structuralSel}`);
+          for (const kid of Array.from(kids)) {
+            if (!seen.has(kid)) visit(kid, null);
+          }
+        }
+      }
       return nodes;
-    },
-    { interactableSel: INTERACTABLE_SELECTOR, structuralSel: STRUCTURAL_SELECTOR, refAttr: REF_ATTR, scopeLabel },
-  );
 }
 
-function assembleNodes(raw: RawNode[]): DomNode[] {
+function walkArgs(scopeLabel?: string): WalkArgs {
+  return {
+    interactableSel: INTERACTABLE_SELECTOR,
+    structuralSel: STRUCTURAL_SELECTOR,
+    refAttr: REF_ATTR,
+    scopeLabel,
+  };
+}
+
+/** Evaluate the DOM walk in the page's main frame. */
+export async function walkDom(page: Page, scopeLabel?: string): Promise<RawNode[]> {
+  return page.evaluate(domWalker, walkArgs(scopeLabel));
+}
+
+/** Evaluate the DOM walk inside a specific iframe. Nodes are tagged with the frame id. */
+export async function walkDomInFrame(frame: Frame, frameId: string): Promise<RawNode[]> {
+  return frame.evaluate(domWalker, walkArgs(frameId));
+}
+
+export function assembleNodes(raw: RawNode[]): DomNode[] {
   const byRef = new Map<string, RawNode>(raw.map((n) => [n.ref, n]));
   const nodes: DomNode[] = raw.map((n) => ({
     ref: n.ref,

@@ -219,6 +219,276 @@ export function createToolRegistry(session: BrowserSession): Map<string, ToolHan
     }),
   );
 
+  register(
+    'browser_double_click',
+    'Double-click the element with the given ref.',
+    {
+      type: 'object',
+      properties: { ref: { type: 'string', description: 'Element ref, e.g. "e3"' } },
+      required: ['ref'],
+    },
+    async (args) => {
+      await session.dblclick(str(args, 'ref'));
+      return { ok: true, data: { doubleClicked: args['ref'] } };
+    },
+  );
+
+  register(
+    'browser_clear',
+    'Clear the editable field with the given ref.',
+    {
+      type: 'object',
+      properties: { ref: { type: 'string', description: 'Element ref, e.g. "e3"' } },
+      required: ['ref'],
+    },
+    async (args) => {
+      await session.clear(str(args, 'ref'));
+      return { ok: true, data: { cleared: args['ref'] } };
+    },
+  );
+
+  register(
+    'browser_press_key',
+    'Press a keyboard key (e.g. "Enter", "Escape", "Tab", "ArrowDown") on the active page.',
+    {
+      type: 'object',
+      properties: { key: { type: 'string', description: 'Key name, e.g. "Enter"' } },
+      required: ['key'],
+    },
+    async (args) => {
+      await session.pressKey(str(args, 'key'));
+      return { ok: true, data: { pressed: args['key'] } };
+    },
+  );
+
+  register(
+    'browser_hover',
+    'Hover the pointer over the element with the given ref.',
+    {
+      type: 'object',
+      properties: { ref: { type: 'string', description: 'Element ref, e.g. "e3"' } },
+      required: ['ref'],
+    },
+    async (args) => {
+      await session.hover(str(args, 'ref'));
+      return { ok: true, data: { hovered: args['ref'] } };
+    },
+  );
+
+  register(
+    'browser_focus',
+    'Move keyboard focus to the element with the given ref.',
+    {
+      type: 'object',
+      properties: { ref: { type: 'string', description: 'Element ref, e.g. "e3"' } },
+      required: ['ref'],
+    },
+    async (args) => {
+      await session.focus(str(args, 'ref'));
+      return { ok: true, data: { focused: args['ref'] } };
+    },
+  );
+
+  register(
+    'browser_scroll_into_view',
+    'Scroll the element with the given ref into the viewport.',
+    {
+      type: 'object',
+      properties: { ref: { type: 'string', description: 'Element ref, e.g. "e3"' } },
+      required: ['ref'],
+    },
+    async (args) => {
+      await session.scrollIntoView(str(args, 'ref'));
+      return { ok: true, data: { scrolledTo: args['ref'] } };
+    },
+  );
+
+  register(
+    'browser_scroll',
+    'Scroll the viewport by dx/dy pixels (negative scrolls up/left).',
+    {
+      type: 'object',
+      properties: {
+        dx: { type: 'number', description: 'Horizontal pixels' },
+        dy: { type: 'number', description: 'Vertical pixels' },
+      },
+    },
+    async (args) => {
+      const dx = typeof args['dx'] === 'number' ? args['dx'] : 0;
+      const dy = typeof args['dy'] === 'number' ? args['dy'] : 0;
+      await session.scrollBy(dx, dy);
+      return { ok: true, data: { scrolledBy: { dx, dy } } };
+    },
+  );
+
+  register(
+    'browser_select_option',
+    'Select option(s) in a <select> element by value.',
+    {
+      type: 'object',
+      properties: {
+        ref: { type: 'string', description: 'Element ref of the select' },
+        values: { type: 'array', items: { type: 'string' }, description: 'Option values to select' },
+      },
+      required: ['ref', 'values'],
+    },
+    async (args) => {
+      const values = args['values'];
+      if (!Array.isArray(values) || !values.every((v) => typeof v === 'string')) {
+        throw new Error('"values" must be an array of strings');
+      }
+      const selected = await session.selectOption(str(args, 'ref'), values as string[]);
+      return { ok: true, data: { selected } };
+    },
+  );
+
+  register(
+    'browser_check',
+    'Check or uncheck a checkbox / radio / switch element.',
+    {
+      type: 'object',
+      properties: {
+        ref: { type: 'string', description: 'Element ref' },
+        checked: { type: 'boolean', description: 'Desired checked state' },
+      },
+      required: ['ref', 'checked'],
+    },
+    async (args) => {
+      if (typeof args['checked'] !== 'boolean') throw new Error('"checked" must be a boolean');
+      await session.setChecked(str(args, 'ref'), args['checked'] as boolean);
+      return { ok: true, data: { ref: args['ref'], checked: args['checked'] } };
+    },
+  );
+
+  register(
+    'browser_wait_for',
+    'Wait for a CSS selector to reach a state ("visible"|"hidden"|"attached").',
+    {
+      type: 'object',
+      properties: {
+        selector: { type: 'string', description: 'CSS selector to wait for' },
+        state: { type: 'string', description: 'visible (default), hidden, or attached' },
+        timeoutMs: { type: 'number', description: 'Timeout in ms (default 10000)' },
+      },
+      required: ['selector'],
+    },
+    async (args) => {
+      const state = args['state'];
+      const s = state === undefined ? 'visible' : str(args, 'state', false) || 'visible';
+      if (!['visible', 'hidden', 'attached'].includes(s)) throw new Error(`bad state "${s}"`);
+      const timeoutMs =
+        typeof args['timeoutMs'] === 'number' ? (args['timeoutMs'] as number) : 10_000;
+      await session.waitForSelector(
+        str(args, 'selector'),
+        s as 'visible' | 'hidden' | 'attached',
+        timeoutMs,
+      );
+      return { ok: true, data: { waitedFor: args['selector'], state: s } };
+    },
+  );
+
+  register(
+    'browser_get_text',
+    'Extract visible text: whole page, or one element when ref is given.',
+    {
+      type: 'object',
+      properties: { ref: { type: 'string', description: 'Optional element ref' } },
+    },
+    async (args) => {
+      const ref = args['ref'];
+      const text = await session.pageText(typeof ref === 'string' && ref ? ref : undefined);
+      return { ok: true, data: { text } };
+    },
+  );
+
+  register(
+    'browser_page_info',
+    'URL, title, and meta description of the active page.',
+    { type: 'object', properties: {} },
+    async () => ({ ok: true, data: await session.pageInfo() }),
+  );
+
+  register(
+    'browser_frames',
+    'List iframes in the active page (id, url, name).',
+    { type: 'object', properties: {} },
+    async () => ({ ok: true, data: { frames: await session.listFrames() } }),
+  );
+
+  register(
+    'browser_frame_snapshot',
+    'Snapshot the DOM inside one iframe; returned refs are frame-scoped and usable by the other tools.',
+    {
+      type: 'object',
+      properties: { frameId: { type: 'string', description: 'Frame id, e.g. "frame-1"' } },
+      required: ['frameId'],
+    },
+    async (args) => {
+      const snap = await session.frameSnapshot(str(args, 'frameId'));
+      const summary = analyze(snap);
+      const tree = renderTree(buildTree(snap.nodes));
+      return {
+        ok: true,
+        data: {
+          url: snap.url,
+          title: snap.title,
+          capturedAt: snap.capturedAt,
+          snapshotId: snap.snapshotId,
+          brief: summary.brief,
+          tree,
+        },
+      };
+    },
+  );
+
+  register(
+    'browser_upload',
+    'Upload a local file through a file input. The path must be absolute and exist; the policy layer must approve uploads first.',
+    {
+      type: 'object',
+      properties: {
+        ref: { type: 'string', description: 'Element ref of the file input' },
+        filePath: { type: 'string', description: 'Absolute local path of the file to upload' },
+      },
+      required: ['ref', 'filePath'],
+    },
+    async (args) => {
+      const r = await session.uploadFile(str(args, 'ref'), str(args, 'filePath'));
+      return { ok: true, data: r };
+    },
+  );
+
+  register(
+    'browser_downloads',
+    'List downloads tracked by this session (saved inside the bridge download dir).',
+    {
+      type: 'object',
+      properties: {
+        consume: { type: 'boolean', description: 'Clear the list after reading (default true)' },
+      },
+    },
+    async (args) => {
+      const consume = args['consume'] === undefined ? true : args['consume'] === true;
+      return { ok: true, data: { downloads: await session.recentDownloads(consume) } };
+    },
+  );
+
+  register(
+    'browser_wait_for_download',
+    'Wait for the next download to complete and report where it was saved.',
+    {
+      type: 'object',
+      properties: {
+        timeoutMs: { type: 'number', description: 'Timeout in ms (default 30000)' },
+      },
+    },
+    async (args) => {
+      const timeoutMs =
+        typeof args['timeoutMs'] === 'number' ? (args['timeoutMs'] as number) : 30_000;
+      return { ok: true, data: await session.waitForDownload(timeoutMs) };
+    },
+  );
+
   return registry;
 }
 

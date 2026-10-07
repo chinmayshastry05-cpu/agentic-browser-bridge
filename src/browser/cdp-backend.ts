@@ -8,6 +8,7 @@
  *
  * and then points the bridge at http://127.0.0.1:9222. The bridge connects
  * over CDP (via Playwright's connectOverCDP) and drives the user's real tabs.
+ * All tab/frame/interaction logic lives in the shared PageBackendBase.
  *
  * Security notes (see README "Security model"):
  *  - The bridge never launches or scans for browsers on its own; attach()
@@ -17,15 +18,9 @@
  *  - Connection state (which endpoint, which tabs) is exposed via
  *    browser_status so it is always visible to the user.
  */
-import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
-import {
-  type BrowserAttachOptions,
-  type BrowserBackend,
-  type BrowserStartOptions,
-  type PageSnapshot,
-  type TabInfo,
-} from '../types.js';
-import { captureSnapshot } from './snapshot.js';
+import { chromium, type Browser } from 'playwright';
+import type { BrowserAttachOptions, BrowserStartOptions } from '../types.js';
+import { PageBackendBase } from './page-backend.js';
 
 function isLoopbackEndpoint(endpoint: string): boolean {
   let url: URL;
@@ -38,20 +33,8 @@ function isLoopbackEndpoint(endpoint: string): boolean {
   return host === '127.0.0.1' || host === 'localhost' || host === '::1';
 }
 
-export class CdpBackend implements BrowserBackend {
+export class CdpBackend extends PageBackendBase {
   readonly backendName = 'cdp';
-  private browser: Browser | null = null;
-  private context: BrowserContext | null = null;
-  private page: Page | null = null;
-  private endpoint: string | null = null;
-  private readonly tabIds = new Map<Page, string>();
-  private tabCounter = 0;
-  private navigationTimeoutMs = 30_000;
-
-  get connected(): boolean {
-    return this.browser !== null;
-  }
-
   get isUserBrowser(): boolean {
     return true;
   }
@@ -98,161 +81,16 @@ export class CdpBackend implements BrowserBackend {
     this.context = contexts[0]!;
     const pages = this.context.pages();
     this.page = pages[0] ?? (await this.context.newPage());
-    this.page.setDefaultNavigationTimeout(this.navigationTimeoutMs);
-    this.page.setDefaultTimeout(Math.min(this.navigationTimeoutMs, 15_000));
     this.endpoint = opts.cdpEndpoint;
-    for (const p of this.context.pages()) this.assignTabId(p);
+    this.afterConnect();
   }
 
   async stop(): Promise<void> {
-    // IMPORTANT: do NOT close the user's browser. Just disconnect.
-    const browser = this.browser;
+    // IMPORTANT: do NOT close the user's browser. Just disconnect —
+    // dropping our references lets the CDP connection finalize.
     this.browser = null;
     this.context = null;
     this.page = null;
     this.endpoint = null;
-    this.tabIds.clear();
-    // connectOverCDP's close() would close the browser; use a best-effort
-    // disconnect via the underlying transport instead. Playwright's Browser
-    // from connectOverCDP: browser.close() closes the browser, so we avoid it.
-    // Dropping our references lets GC finalize the connection.
-    void browser;
-  }
-
-  private requirePage(): Page {
-    if (!this.page || !this.context)
-      throw new Error('not attached: call attach({ cdpEndpoint }) first');
-    return this.page;
-  }
-
-  private requireContext(): BrowserContext {
-    if (!this.context) throw new Error('not attached: call attach({ cdpEndpoint }) first');
-    return this.context;
-  }
-
-  private assignTabId(page: Page): string {
-    let id = this.tabIds.get(page);
-    if (!id) {
-      this.tabCounter += 1;
-      id = `tab-${this.tabCounter}`;
-      this.tabIds.set(page, id);
-    }
-    return id;
-  }
-
-  /** Reconcile tracked tabs with the live page list (tabs may open/close externally). */
-  private reconcile(): Page[] {
-    const ctx = this.requireContext();
-    const live = ctx.pages();
-    const liveSet = new Set(live);
-    for (const p of [...this.tabIds.keys()]) {
-      if (!liveSet.has(p) || p.isClosed()) this.tabIds.delete(p);
-    }
-    for (const p of live) this.assignTabId(p);
-    if (!this.page || this.page.isClosed() || !liveSet.has(this.page)) {
-      this.page = live[0] ?? null;
-    }
-    return live;
-  }
-
-  private async tabInfo(page: Page): Promise<TabInfo> {
-    return {
-      id: this.assignTabId(page),
-      url: page.url(),
-      title: await page.title().catch(() => ''),
-      active: page === this.page,
-    };
-  }
-
-  async listTabs(): Promise<TabInfo[]> {
-    const live = this.reconcile();
-    return Promise.all(live.map((p) => this.tabInfo(p)));
-  }
-
-  async activeTab(): Promise<TabInfo> {
-    this.reconcile();
-    return this.tabInfo(this.requirePage());
-  }
-
-  async openTab(url?: string): Promise<TabInfo> {
-    const page = await this.requireContext().newPage();
-    this.assignTabId(page);
-    this.page = page;
-    if (url) await page.goto(url, { waitUntil: 'domcontentloaded' });
-    return this.tabInfo(page);
-  }
-
-  async switchTab(tabId: string): Promise<TabInfo> {
-    this.reconcile();
-    for (const [page, id] of this.tabIds) {
-      if (id === tabId && !page.isClosed()) {
-        this.page = page;
-        await page.bringToFront().catch(() => undefined);
-        return this.tabInfo(page);
-      }
-    }
-    throw new Error(`unknown tab "${tabId}" — list tabs with browser_tabs first`);
-  }
-
-  async closeTab(tabId: string): Promise<void> {
-    this.reconcile();
-    for (const [page, id] of this.tabIds) {
-      if (id === tabId) {
-        if (this.requireContext().pages().length <= 1) {
-          throw new Error('refusing to close the last tab of the session');
-        }
-        await page.close().catch(() => undefined);
-        this.tabIds.delete(page);
-        this.reconcile();
-        return;
-      }
-    }
-    throw new Error(`unknown tab "${tabId}"`);
-  }
-
-  async goto(url: string): Promise<void> {
-    await this.requirePage().goto(url, { waitUntil: 'domcontentloaded' });
-  }
-
-  async goBack(): Promise<void> {
-    await this.requirePage().goBack({ waitUntil: 'domcontentloaded' }).catch(() => undefined);
-  }
-
-  async goForward(): Promise<void> {
-    await this.requirePage().goForward({ waitUntil: 'domcontentloaded' }).catch(() => undefined);
-  }
-
-  async reload(): Promise<void> {
-    await this.requirePage().reload({ waitUntil: 'domcontentloaded' });
-  }
-
-  currentUrl(): string {
-    return this.page?.url() ?? '';
-  }
-
-  async title(): Promise<string> {
-    return this.requirePage().title();
-  }
-
-  async click(selector: string): Promise<void> {
-    const page = this.requirePage();
-    await page.locator(selector).first().scrollIntoViewIfNeeded().catch(() => undefined);
-    await page.locator(selector).first().click({ timeout: 10_000 });
-  }
-
-  async type(selector: string, text: string, submit: boolean): Promise<void> {
-    const page = this.requirePage();
-    const locator = page.locator(selector).first();
-    await locator.scrollIntoViewIfNeeded().catch(() => undefined);
-    await locator.fill(text, { timeout: 10_000 });
-    if (submit) await page.keyboard.press('Enter');
-  }
-
-  async screenshot(path: string): Promise<void> {
-    await this.requirePage().screenshot({ path, fullPage: false });
-  }
-
-  async snapshot(): Promise<PageSnapshot> {
-    return captureSnapshot(this.requirePage());
   }
 }

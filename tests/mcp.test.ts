@@ -17,7 +17,10 @@ import type {
   BrowserAttachOptions,
   BrowserBackend,
   DomNode,
+  DownloadRecord,
+  FrameInfo,
   LLMProvider,
+  PageInfo,
   PageSnapshot,
   TabInfo,
 } from '../src/types.js';
@@ -99,10 +102,38 @@ class MockBackend implements BrowserBackend {
     this.snapshotCounter += 1;
     return { ...this.snapshotData, snapshotId: `snap-mock-${this.snapshotCounter}` };
   }
-  async click(selector: string): Promise<void> { this.clicked.push(selector); }
-  async type(selector: string, text: string, submit: boolean): Promise<void> {
+  async click(selector: string, _frameId?: string): Promise<void> { this.clicked.push(selector); }
+  async dblclick(selector: string, _frameId?: string): Promise<void> { this.clicked.push(`dbl:${selector}`); }
+  async type(selector: string, text: string, submit: boolean, _frameId?: string): Promise<void> {
     this.typed.push({ selector, text, submit });
   }
+  async clear(selector: string, _frameId?: string): Promise<void> { this.typed.push({ selector, text: '', submit: false }); }
+  async pressKey(key: string, _frameId?: string): Promise<void> { this.typed.push({ selector: '<keyboard>', text: key, submit: false }); }
+  async hover(selector: string, _frameId?: string): Promise<void> { this.clicked.push(`hover:${selector}`); }
+  async focus(selector: string, _frameId?: string): Promise<void> { this.clicked.push(`focus:${selector}`); }
+  async scrollIntoView(selector: string, _frameId?: string): Promise<void> { this.clicked.push(`scrollto:${selector}`); }
+  async selectOption(selector: string, values: string[], _frameId?: string): Promise<string[]> {
+    this.typed.push({ selector, text: values.join(','), submit: false });
+    return values;
+  }
+  async setChecked(selector: string, checked: boolean, _frameId?: string): Promise<void> {
+    this.typed.push({ selector, text: checked ? 'checked' : 'unchecked', submit: false });
+  }
+  async scrollBy(_dx: number, _dy: number): Promise<void> { /* noop */ }
+  async waitForSelector(_selector: string, _state: 'visible' | 'hidden' | 'attached', _timeoutMs: number, _frameId?: string): Promise<void> { /* noop */ }
+  async pageText(selector?: string, _frameId?: string): Promise<string> {
+    return selector ? `text of ${selector}` : 'page text';
+  }
+  async pageInfo(): Promise<PageInfo> {
+    return { url: this.snapshotData.url, title: this.snapshotData.title, description: 'mock page' };
+  }
+  async listFrames(): Promise<FrameInfo[]> { return []; }
+  async frameSnapshot(_frameId: string): Promise<PageSnapshot> { throw new Error('no frames in mock'); }
+  async uploadFile(selector: string, filePath: string, _frameId?: string): Promise<void> {
+    this.typed.push({ selector, text: `upload:${filePath}`, submit: false });
+  }
+  async recentDownloads(_consume: boolean): Promise<DownloadRecord[]> { return []; }
+  async waitForDownload(_timeoutMs: number): Promise<DownloadRecord> { throw new Error('no downloads in mock'); }
   async screenshot(path: string): Promise<void> { this.screenshots.push(path); }
   currentUrl(): string { return this.snapshotData.url; }
   async title(): Promise<string> { return this.snapshotData.title; }
@@ -188,18 +219,35 @@ describe('mcp tools', () => {
     const defs = listToolDefinitions(createToolRegistry(session));
     expect(defs.map((d) => d.name).sort()).toEqual([
       'browser_back',
+      'browser_check',
+      'browser_clear',
       'browser_click',
       'browser_close_tab',
+      'browser_double_click',
+      'browser_downloads',
+      'browser_focus',
       'browser_forward',
+      'browser_frame_snapshot',
+      'browser_frames',
+      'browser_get_text',
+      'browser_hover',
       'browser_navigate',
       'browser_open_tab',
+      'browser_page_info',
+      'browser_press_key',
       'browser_reload',
       'browser_screenshot',
+      'browser_scroll',
+      'browser_scroll_into_view',
+      'browser_select_option',
       'browser_snapshot',
       'browser_status',
       'browser_switch_tab',
       'browser_tabs',
       'browser_type',
+      'browser_upload',
+      'browser_wait_for',
+      'browser_wait_for_download',
     ]);
     for (const d of defs) {
       expect(d.description.length).toBeGreaterThan(10);

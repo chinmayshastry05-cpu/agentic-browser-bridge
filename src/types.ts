@@ -125,8 +125,38 @@ export interface BrowserBackend {
   closeTab(tabId: string): Promise<void>;
   activeTab(): Promise<TabInfo>;
   snapshot(): Promise<PageSnapshot>;
-  click(selector: string): Promise<void>;
-  type(selector: string, text: string, submit: boolean): Promise<void>;
+  click(selector: string, frameId?: string): Promise<void>;
+  dblclick(selector: string, frameId?: string): Promise<void>;
+  type(selector: string, text: string, submit: boolean, frameId?: string): Promise<void>;
+  /** Clear an editable field (no text argument — never used for secrets). */
+  clear(selector: string, frameId?: string): Promise<void>;
+  pressKey(key: string, frameId?: string): Promise<void>;
+  hover(selector: string, frameId?: string): Promise<void>;
+  focus(selector: string, frameId?: string): Promise<void>;
+  scrollIntoView(selector: string, frameId?: string): Promise<void>;
+  selectOption(selector: string, values: string[], frameId?: string): Promise<string[]>;
+  setChecked(selector: string, checked: boolean, frameId?: string): Promise<void>;
+  /** Scroll the viewport by a delta, or scroll to top/bottom. */
+  scrollBy(dx: number, dy: number): Promise<void>;
+  /** Wait for a selector to reach a state ("visible"|"hidden"|"attached"). */
+  waitForSelector(selector: string, state: 'visible' | 'hidden' | 'attached', timeoutMs: number, frameId?: string): Promise<void>;
+  /** Visible text of the page, or of one element. */
+  pageText(selector?: string, frameId?: string): Promise<string>;
+  /** URL/title/meta description of the active page. */
+  pageInfo(): Promise<PageInfo>;
+  /** Frames (iframes) in the active page. */
+  listFrames(): Promise<FrameInfo[]>;
+  /** Snapshot scoped to one frame; refs carry that frame's id. */
+  frameSnapshot(frameId: string): Promise<PageSnapshot>;
+  /**
+   * Upload a local file through a file input. The path must be absolute and
+   * exist; the caller (policy layer) is responsible for user approval.
+   */
+  uploadFile(selector: string, filePath: string, frameId?: string): Promise<void>;
+  /** Downloads observed since session start (or since last call with consume=true). */
+  recentDownloads(consume: boolean): Promise<DownloadRecord[]>;
+  /** Wait for the next download to complete. Throws on timeout. */
+  waitForDownload(timeoutMs: number): Promise<DownloadRecord>;
   screenshot(path: string): Promise<void>;
   currentUrl(): string;
   title(): Promise<string>;
@@ -152,6 +182,30 @@ export interface TabInfo {
   url: string;
   title: string;
   active: boolean;
+}
+
+/** One iframe in the active page. */
+export interface FrameInfo {
+  /** Bridge-assigned id for the session lifetime, e.g. "frame-1". */
+  id: string;
+  url: string;
+  name: string;
+}
+
+/** URL/title/meta description of the active page. */
+export interface PageInfo {
+  url: string;
+  title: string;
+  description: string;
+}
+
+/** A completed download tracked by the backend. */
+export interface DownloadRecord {
+  url: string;
+  suggestedFilename: string;
+  /** Safe absolute path where the file was saved (inside the bridge download dir). */
+  path: string;
+  finishedAt: string;
 }
 
 /** LLM provider contract — pluggable, key always comes from the environment. */

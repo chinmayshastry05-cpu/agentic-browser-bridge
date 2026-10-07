@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ABB v1 fixture</title>
+<meta name="description" content="Deterministic fixture page for the Agentic Browser bridge acceptance suite.">
+<style>
+  body { font-family: sans-serif; max-width: 700px; margin: 2rem auto; }
+  .tall { height: 1200px; background: linear-gradient(#fff, #eef); }
+  #delayed { display: none; margin: 1rem 0; padding: 1rem; background: #dfd; }
+  #shadow-host { margin: 1rem 0; padding: 1rem; border: 1px dashed #888; }
+  iframe { width: 100%; height: 120px; border: 1px solid #888; }
+</style>
+</head>
+<body>
+<main>
+  <h1>ABB v1 fixture</h1>
+  <p id="intro">This page exercises forms, frames, shadow DOM, delayed content, uploads and downloads.</p>
+
+  <form id="controls" action="/upload" method="post" enctype="multipart/form-data">
+    <label>Your name <input id="name" name="name" type="text" placeholder="e.g. Ada"></label><br>
+    <label>Notes <textarea id="notes" name="notes" rows="2"></textarea></label><br>
+    <label>Color
+      <select id="color" name="color">
+        <option value="">-- pick --</option>
+        <option value="red">Red</option>
+        <option value="green">Green</option>
+        <option value="blue">Blue</option>
+      </select>
+    </label><br>
+    <label><input id="agree" name="agree" type="checkbox"> I agree</label><br>
+    <label><input id="plan-free" name="plan" type="radio" value="free"> Free</label>
+    <label><input id="plan-pro" name="plan" type="radio" value="pro"> Pro</label><br>
+    <label>Avatar <input id="avatar" name="avatar" type="file"></label>
+    <span id="file-chosen"></span><br>
+    <button id="greet" type="button">Greet me</button>
+    <button id="dbl" type="button">Double-click me</button>
+  </form>
+  <p id="greeting" aria-live="polite"></p>
+  <p id="dbl-count">double-clicks: 0</p>
+
+  <div id="delayed">I appeared after a delay.</div>
+
+  <h2>Frame</h2>
+  <iframe id="inner-frame" name="inner" src="/frame.html" title="inner frame"></iframe>
+
+  <h2>Shadow DOM</h2>
+  <div id="shadow-host"></div>
+
+  <h2>Download</h2>
+  <a id="dl" href="/download" download="fixture.txt">Download fixture file</a>
+
+  <div class="tall"><h2 id="bottom-marker">bottom of page</h2></div>
+</main>
+<script>
+  document.getElementById('greet').addEventListener('click', () => {
+    const name = document.getElementById('name').value || 'stranger';
+    document.getElementById('greeting').textContent = 'Hello, ' + name + '!';
+  });
+  let dbls = 0;
+  document.getElementById('dbl').addEventListener('dblclick', () => {
+    dbls += 1;
+    document.getElementById('dbl-count').textContent = 'double-clicks: ' + dbls;
+  });
+  setTimeout(() => { document.getElementById('delayed').style.display = 'block'; }, 1500);
+  document.getElementById('avatar').addEventListener('change', (e) => {
+    const f = e.target.files[0];
+    document.getElementById('file-chosen').textContent = f ? 'chosen: ' + f.name : '';
+  });
+  const host = document.getElementById('shadow-host');
+  const root = host.attachShadow({ mode: 'open' });
+  const btn = document.createElement('button');
+  btn.id = 'shadow-btn';
+  btn.textContent = 'Shadow button';
+  const out = document.createElement('h3');
+  out.id = 'shadow-out';
+  btn.addEventListener('click', () => { out.textContent = 'shadow clicked'; });
+  root.appendChild(btn);
+  root.appendChild(out);
+</script>
+</body>
+</html>

@@ -23,6 +23,9 @@ import {
   type BrowserAttachOptions,
   type BrowserBackend,
   type BrowserStartOptions,
+  type DownloadRecord,
+  type FrameInfo,
+  type PageInfo,
   type PageSnapshot,
   type TabInfo,
 } from './types.js';
@@ -42,7 +45,7 @@ export { PlaywrightBackend, CdpBackend };
 export class BrowserSession {
   readonly id: string;
   private readonly backend: BrowserBackend;
-  private selectorByRef = new Map<string, string>();
+  private targetByRef = new Map<string, { selector: string; frameId?: string }>();
   private lastSnapshot: PageSnapshot | null = null;
 
   constructor(id: string, backend: BrowserBackend = new PlaywrightBackend()) {
@@ -69,7 +72,7 @@ export class BrowserSession {
 
   async close(): Promise<void> {
     await this.backend.stop();
-    this.selectorByRef.clear();
+    this.targetByRef.clear();
     this.lastSnapshot = null;
   }
 
@@ -114,28 +117,122 @@ export class BrowserSession {
 
   async snapshot(): Promise<PageSnapshot> {
     const snap = await this.backend.snapshot();
-    this.selectorByRef.clear();
-    for (const n of snap.nodes) this.selectorByRef.set(n.ref, n.selector);
-    this.lastSnapshot = snap;
+    this.registerSnapshot(snap);
     return snap;
   }
 
-  private selectorFor(ref: string): string {
-    const sel = this.selectorByRef.get(ref);
-    if (!sel) {
+  /** Snapshot scoped to one iframe; refs carry that frame's id. */
+  async frameSnapshot(frameId: string): Promise<PageSnapshot> {
+    const snap = await this.backend.frameSnapshot(frameId);
+    this.registerSnapshot(snap);
+    return snap;
+  }
+
+  private registerSnapshot(snap: PageSnapshot): void {
+    this.targetByRef.clear();
+    for (const n of snap.nodes) {
+      this.targetByRef.set(n.ref, { selector: n.selector, frameId: n.frameId });
+    }
+    this.lastSnapshot = snap;
+  }
+
+  private targetFor(ref: string): { selector: string; frameId?: string } {
+    const t = this.targetByRef.get(ref);
+    if (!t) {
       throw new Error(
         `unknown element ref "${ref}" — take a fresh browser_snapshot first (refs expire per snapshot)`,
       );
     }
-    return sel;
+    return t;
   }
 
   async click(ref: string): Promise<void> {
-    await this.backend.click(this.selectorFor(ref));
+    const t = this.targetFor(ref);
+    await this.backend.click(t.selector, t.frameId);
+  }
+
+  async dblclick(ref: string): Promise<void> {
+    const t = this.targetFor(ref);
+    await this.backend.dblclick(t.selector, t.frameId);
   }
 
   async type(ref: string, text: string, submit = false): Promise<void> {
-    await this.backend.type(this.selectorFor(ref), text, submit);
+    const t = this.targetFor(ref);
+    await this.backend.type(t.selector, text, submit, t.frameId);
+  }
+
+  async clear(ref: string): Promise<void> {
+    const t = this.targetFor(ref);
+    await this.backend.clear(t.selector, t.frameId);
+  }
+
+  async pressKey(key: string): Promise<void> {
+    await this.backend.pressKey(key);
+  }
+
+  async hover(ref: string): Promise<void> {
+    const t = this.targetFor(ref);
+    await this.backend.hover(t.selector, t.frameId);
+  }
+
+  async focus(ref: string): Promise<void> {
+    const t = this.targetFor(ref);
+    await this.backend.focus(t.selector, t.frameId);
+  }
+
+  async scrollIntoView(ref: string): Promise<void> {
+    const t = this.targetFor(ref);
+    await this.backend.scrollIntoView(t.selector, t.frameId);
+  }
+
+  async selectOption(ref: string, values: string[]): Promise<string[]> {
+    const t = this.targetFor(ref);
+    return this.backend.selectOption(t.selector, values, t.frameId);
+  }
+
+  async setChecked(ref: string, checked: boolean): Promise<void> {
+    const t = this.targetFor(ref);
+    await this.backend.setChecked(t.selector, checked, t.frameId);
+  }
+
+  async scrollBy(dx: number, dy: number): Promise<void> {
+    await this.backend.scrollBy(dx, dy);
+  }
+
+  async waitForSelector(
+    selector: string,
+    state: 'visible' | 'hidden' | 'attached' = 'visible',
+    timeoutMs = 10_000,
+  ): Promise<void> {
+    await this.backend.waitForSelector(selector, state, timeoutMs);
+  }
+
+  async pageText(ref?: string): Promise<string> {
+    if (!ref) return this.backend.pageText();
+    const t = this.targetFor(ref);
+    return this.backend.pageText(t.selector, t.frameId);
+  }
+
+  async pageInfo(): Promise<PageInfo> {
+    return this.backend.pageInfo();
+  }
+
+  async listFrames(): Promise<FrameInfo[]> {
+    return this.backend.listFrames();
+  }
+
+  async uploadFile(ref: string, filePath: string): Promise<{ uploaded: string; to: string }> {
+    const t = this.targetFor(ref);
+    await this.backend.uploadFile(t.selector, filePath, t.frameId);
+    return { uploaded: filePath, to: ref };
+  }
+
+  async recentDownloads(consume = true): Promise<DownloadRecord[]> {
+    return this.backend.recentDownloads(consume);
+  }
+
+  async waitForDownload(timeoutMs = 30_000): Promise<DownloadRecord> {
+    return this.backend.waitForDownload(timeoutMs);
   }
 
   async screenshot(path: string): Promise<{ path: string }> {

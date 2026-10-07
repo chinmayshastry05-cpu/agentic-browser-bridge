@@ -36,6 +36,9 @@ An agent can't click what it can't see. This bridge gives it eyes and hands:
   matching on the control's accessible name — icon-only buttons with no
   accessible name are NOT caught. High-risk actions stop the loop with
   `awaiting_confirmation` until the operator approves via CLI or UI.
+  Approvals are exact and single-use: each one binds the full action
+  arguments, the page/snapshot state, and the requesting session, expires
+  after 10 minutes, and is consumed by the retry it unblocks.
 
 ## Architecture
 

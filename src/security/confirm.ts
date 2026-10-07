@@ -8,22 +8,85 @@
  *
  * The queue is file-backed (<dataDir>/confirmations/) so approvals work
  * across processes: approve in one terminal, resume the task in another.
+ *
+ * APPROVAL SCOPE (exact, fail-closed). An approval authorizes ONE specific
+ * action and nothing else. All of the following must hold for
+ * isApproved() to return true:
+ *   1. scopeKey matches — e.g. "mcp:<mcp-session-id>" or "task:<taskId>".
+ *      An approval granted in one MCP session never authorizes another
+ *      session, and an old unscoped ticket never matches a scoped check.
+ *   2. argsFingerprint matches — SHA-256 over the CANONICAL FULL action
+ *      args (every argument: text, values, checked, url, ...). Approving
+ *      `type e4 "hello"` does NOT approve `type e4 "rm -rf /"`.
+ *   3. pageFingerprint matches — "<url>::<snapshotId>" captured at ticket
+ *      time. Navigation, or a snapshot rotation (which reassigns refs),
+ *      voids the approval: refs must not be reused across pages/snapshots.
+ *   4. Not expired — approvals live 10 minutes from issuance (TTL).
+ *   5. Not already consumed — each approval is single-use. The retry that
+ *      the approval unblocks consumes it atomically; a second identical
+ *      call needs a fresh ticket.
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { AgentAction } from '../types.js';
 import type { RiskLevel } from './policy.js';
 
+/** Default approval lifetime: 10 minutes. */
+export const APPROVAL_TTL_MS = 10 * 60 * 1000;
+
 export interface PendingConfirmation {
   id: string;
+  /** Approval scope: e.g. "mcp:<sessionId>", "mcp:stdio", "task:<taskId>". */
   taskId: string;
   action: AgentAction;
   reason: string;
   risk: RiskLevel;
+  /** SHA-256 hex of the canonical full action args (see fingerprintAction). */
+  argsFingerprint: string;
+  /** "<pageUrl>::<snapshotId>" captured when the ticket was requested. */
+  pageFingerprint: string;
   createdAt: string;
+  /** Approvals expire; an expired approval never authorizes anything. */
+  expiresAt: string;
   resolvedAt: string | null;
   approved: boolean | null;
+  /** Set when an approval is consumed (single-use). */
+  consumedAt: string | null;
+}
+
+/** What isApproved() checks an action against. */
+export interface ApprovalScope {
+  scopeKey: string;
+  pageFingerprint: string;
+}
+
+/** Deterministic JSON: object keys sorted recursively, undefined dropped. */
+function canonicalize(value: unknown): string {
+  if (value === null || value === undefined) return 'null';
+  if (Array.isArray(value)) return `[${value.map(canonicalize).join(',')}]`;
+  if (typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalize(v)}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+/**
+ * Canonical fingerprint of the FULL action args. Two actions are the same
+ * approvable unit iff their fingerprints are equal — every argument
+ * (text, values, checked, url, key, ...) participates, not just
+ * action/ref/url.
+ */
+export function fingerprintAction(action: AgentAction): string {
+  return createHash('sha256').update(canonicalize(action)).digest('hex');
+}
+
+/** True when two actions are the same approvable unit (full-args comparison). */
+export function sameAction(a: AgentAction, b: AgentAction): boolean {
+  return fingerprintAction(a) === fingerprintAction(b);
 }
 
 export class ConfirmationQueue {
@@ -53,16 +116,34 @@ export class ConfirmationQueue {
     return JSON.parse(readFileSync(p, 'utf8')) as PendingConfirmation;
   }
 
-  request(taskId: string, action: AgentAction, reason: string, risk: RiskLevel): PendingConfirmation {
+  private all(): PendingConfirmation[] {
+    return readdirSync(this.dir)
+      .filter((f) => f.endsWith('.json'))
+      .map((f) => JSON.parse(readFileSync(join(this.dir, f), 'utf8')) as PendingConfirmation);
+  }
+
+  request(
+    taskId: string,
+    action: AgentAction,
+    reason: string,
+    risk: RiskLevel,
+    pageFingerprint: string,
+    opts: { ttlMs?: number } = {},
+  ): PendingConfirmation {
+    const now = new Date();
     const confirmation: PendingConfirmation = {
       id: `confirm-${randomUUID().slice(0, 8)}`,
       taskId,
       action,
       reason,
       risk,
-      createdAt: new Date().toISOString(),
+      argsFingerprint: fingerprintAction(action),
+      pageFingerprint,
+      createdAt: now.toISOString(),
+      expiresAt: new Date(now.getTime() + (opts.ttlMs ?? APPROVAL_TTL_MS)).toISOString(),
       resolvedAt: null,
       approved: null,
+      consumedAt: null,
     };
     this.write(confirmation);
     return confirmation;
@@ -86,30 +167,32 @@ export class ConfirmationQueue {
   }
 
   listUnresolved(): PendingConfirmation[] {
-    return readdirSync(this.dir)
-      .filter((f) => f.endsWith('.json'))
-      .map((f) => JSON.parse(readFileSync(join(this.dir, f), 'utf8')) as PendingConfirmation)
+    return this.all()
       .filter((c) => !c.resolvedAt)
       .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
   }
 
   /**
-   * True when the operator previously approved this exact action for this
-   * task. The loop consults this before the policy engine on resume, so an
-   * approved action is not asked about twice.
+   * True only when an operator approval exists for THIS EXACT scope, page,
+   * and full action args, and it is unexpired and unconsumed. On success the
+   * approval is consumed atomically (single-use): the same call a second
+   * time requires a fresh ticket.
    */
-  isApproved(taskId: string | null, action: AgentAction): boolean {
-    if (!taskId) return false;
-    return readdirSync(this.dir)
-      .filter((f) => f.endsWith('.json'))
-      .map((f) => JSON.parse(readFileSync(join(this.dir, f), 'utf8')) as PendingConfirmation)
-      .some(
-        (c) =>
-          c.taskId === taskId &&
-          c.approved === true &&
-          c.action.action === action.action &&
-          c.action.ref === action.ref &&
-          c.action.url === action.url,
-      );
+  isApproved(scope: ApprovalScope, action: AgentAction): boolean {
+    const now = Date.now();
+    const want = fingerprintAction(action);
+    for (const c of this.all()) {
+      if (c.taskId !== scope.scopeKey) continue;
+      if (c.approved !== true) continue;
+      if (c.consumedAt) continue;
+      if (Number.isNaN(Date.parse(c.expiresAt)) || Date.parse(c.expiresAt) <= now) continue;
+      if (c.argsFingerprint !== want) continue;
+      if (c.pageFingerprint !== scope.pageFingerprint) continue;
+      // Exact match — consume atomically so the approval is single-use.
+      c.consumedAt = new Date(now).toISOString();
+      this.write(c);
+      return true;
+    }
+    return false;
   }
 }

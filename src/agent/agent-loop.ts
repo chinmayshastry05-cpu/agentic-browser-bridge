@@ -232,8 +232,12 @@ export class AgentLoop {
     // 3. CHECK (policy gate)
     try {
       // An operator-approved action is not asked about twice (resume flow).
+      // Approvals are exact: same session-task scope, same full args, same
+      // page state, unexpired, single-use.
+      const scopeKey = `task:${this.currentTaskId ?? 'adhoc'}`;
+      const pageFp = `${this.session.url}::${this.session.lastSnapshotId ?? 'none'}`;
       const preApproved =
-        this.confirmations?.isApproved(this.currentTaskId, action) ?? false;
+        this.confirmations?.isApproved({ scopeKey, pageFingerprint: pageFp }, action) ?? false;
       if (!preApproved) {
         const ctx: PolicyContext = { url: this.session.url };
         if (action.ref) {
@@ -255,10 +259,11 @@ export class AgentLoop {
           let confirmationNote = '';
           if (this.confirmations) {
             const c: PendingConfirmation = this.confirmations.request(
-              this.currentTaskId ?? 'adhoc',
+              `task:${this.currentTaskId ?? 'adhoc'}`,
               action,
               decision.reason,
               decision.risk,
+              `${this.session.url}::${this.session.lastSnapshotId ?? 'none'}`,
             );
             confirmationNote = ` (confirmation id: ${c.id})`;
           }

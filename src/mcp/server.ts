@@ -41,7 +41,7 @@ import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import type { BrowserSession } from '../bridge-core.js';
 import { createToolRegistry } from '../tools.js';
 import { PolicyEngine, type PolicyContext } from '../security/policy.js';
-import { ConfirmationQueue, type PendingConfirmation } from '../security/confirm.js';
+import { ConfirmationQueue, sameAction, type ApprovalScope, type PendingConfirmation } from '../security/confirm.js';
 import type { AgentAction } from '../types.js';
 import { OAuthProvider, OAuthError } from './oauth.js';
 
@@ -182,9 +182,14 @@ function resolveUploadAllowlist(explicit?: string[]): string[] {
   return raw.map((p) => p.trim()).filter((p) => p.startsWith('/'));
 }
 
-/** True when two actions are the same approvable unit (mirrors ConfirmationQueue.isApproved). */
-function sameAction(a: AgentAction, b: AgentAction): boolean {
-  return a.action === b.action && a.ref === b.ref && a.url === b.url;
+/**
+ * Build the page/target fingerprint binding an approval to the exact page
+ * state: "<url>::<snapshotId>". Navigation changes the URL; a fresh
+ * snapshot rotates the id (refs are snapshot-scoped) — either voids the
+ * approval, so approvals can never survive navigation or ref reuse.
+ */
+function pageFingerprint(session: BrowserSession): string {
+  return `${session.url}::${session.lastSnapshotId ?? 'none'}`;
 }
 
 /**
@@ -263,12 +268,20 @@ export function buildMcpServer(
         inputSchema: jsonSchemaToZod(handler.definition.inputSchema),
         annotations: TOOL_ANNOTATIONS[name] ?? DEFAULT_ANNOTATIONS,
       },
-      async (args: unknown) => {
+      async (args: unknown, extra?: { sessionId?: string }) => {
         // The SDK validates args against the Zod schema before we run; narrow
         // for the registry, which takes Record<string, unknown>.
         const a: Record<string, unknown> =
           args && typeof args === 'object' ? (args as Record<string, unknown>) : {};
         const action = toolToAction(name, a);
+        // Approval scope: bound to THIS MCP session (extra.sessionId comes
+        // from the transport; 'stdio' for the local pipe). An approval
+        // granted in one session never authorizes another.
+        const scopeKey = `mcp:${extra?.sessionId ?? 'stdio'}`;
+        // Page/target fingerprint at check time. Must equal the fingerprint
+        // captured when the ticket was requested, or the approval is void.
+        const fingerprint = pageFingerprint(session);
+        const scope: ApprovalScope = { scopeKey, pageFingerprint: fingerprint };
         const ctx: PolicyContext = { url: session.url };
         if (action.ref) {
           const live = await session.describeLiveTarget(action.ref).catch(() => null);
@@ -298,18 +311,30 @@ export function buildMcpServer(
           return errText(`denied by policy: ${decision.reason}`);
         }
         if (decision.verdict === 'confirm') {
-          // Real ticket continuation: an operator approval of this exact
-          // action (via the bridge UI "Pending confirmations" or
+          // Real ticket continuation: an operator approval of this EXACT
+          // action (full args), in this session, on this exact page state
+          // (via the bridge UI "Pending confirmations" or
           // `node dist/index.js approve <id> --yes`) is honored on retry.
-          if (!confirmations.isApproved('mcp', action)) {
+          // Approvals are single-use, expire after 10 minutes, and are
+          // voided by navigation or snapshot rotation.
+          if (!confirmations.isApproved(scope, action)) {
             const existing: PendingConfirmation | undefined = confirmations
               .listUnresolved()
-              .find((c) => c.taskId === 'mcp' && sameAction(c.action, action));
-            const ticket = existing ?? confirmations.request('mcp', action, decision.reason, decision.risk);
+              .find(
+                (c) =>
+                  c.taskId === scopeKey &&
+                  c.pageFingerprint === fingerprint &&
+                  sameAction(c.action, action),
+              );
+            const ticket =
+              existing ??
+              confirmations.request(scopeKey, action, decision.reason, decision.risk, fingerprint);
             return errText(
               `requires human confirmation (${decision.reason}). Confirmation ticket ` +
                 `${ticket.id} registered — approve with: node dist/index.js approve ${ticket.id} ` +
-                `--yes (or the bridge UI "Pending confirmations"), then retry this tool.`,
+                `--yes (or the bridge UI "Pending confirmations"), then retry this tool. ` +
+                `The approval covers only this exact call (same arguments, same page, ` +
+                `same session) and is single-use.`,
             );
           }
         }

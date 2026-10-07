@@ -6,7 +6,7 @@ import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PolicyEngine } from '../src/security/policy.js';
-import { ConfirmationQueue } from '../src/security/confirm.js';
+import { ConfirmationQueue, sameAction } from '../src/security/confirm.js';
 import { containsSecret, redactSecrets } from '../src/security/redact.js';
 import { injectionNotice, scanForInjection } from '../src/security/injection.js';
 import type { AgentAction, DomNode } from '../src/types.js';
@@ -100,18 +100,26 @@ describe('PolicyEngine', () => {
   });
 });
 
-describe('ConfirmationQueue', () => {
+describe('ConfirmationQueue (exact approval scope)', () => {
   const action: AgentAction = { action: 'type', ref: 'e9', text: 'x' };
+  const FP = 'https://example.test/::snap-1';
 
   function tmpQueue(): ConfirmationQueue {
     return new ConfirmationQueue(mkdtempSync(join(tmpdir(), 'abb-confirm-')));
   }
 
+  function scope(key = 'task-1', fp = FP) {
+    return { scopeKey: key, pageFingerprint: fp };
+  }
+
   it('requests and resolves confirmations; the model cannot resolve them', () => {
     const q = tmpQueue();
-    const c = q.request('task-1', action, 'password field', 'high');
+    const c = q.request('task-1', action, 'password field', 'high', FP);
     expect(c.id).toMatch(/^confirm-/);
     expect(c.approved).toBeNull();
+    expect(c.argsFingerprint).toMatch(/^[0-9a-f]{64}$/);
+    expect(c.expiresAt).not.toBeNull();
+    expect(c.consumedAt).toBeNull();
     expect(q.listUnresolved()).toHaveLength(1);
 
     const resolved = q.resolve(c.id, true);
@@ -122,22 +130,76 @@ describe('ConfirmationQueue', () => {
 
   it('rejects double-resolve and unknown ids', () => {
     const q = tmpQueue();
-    const c = q.request('task-1', action, 'r', 'high');
+    const c = q.request('task-1', action, 'r', 'high', FP);
     q.resolve(c.id, false);
     expect(() => q.resolve(c.id, true)).toThrow(/already resolved/);
     expect(() => q.resolve('confirm-nope', true)).toThrow(/unknown confirmation/);
   });
 
-  it('persists across processes and matches approvals by action', () => {
+  it('persists across processes and matches approvals by exact scope', () => {
     const dir = mkdtempSync(join(tmpdir(), 'abb-confirm-'));
     const q1 = new ConfirmationQueue(dir);
-    const c = q1.request('task-9', action, 'r', 'high');
+    const c = q1.request('task-9', action, 'r', 'high', FP);
     const q2 = new ConfirmationQueue(dir); // simulates another process
     expect(q2.listUnresolved()).toHaveLength(1);
     q2.resolve(c.id, true);
-    expect(q2.isApproved('task-9', action)).toBe(true);
-    expect(q2.isApproved('task-9', { action: 'click', ref: 'e9' })).toBe(false);
-    expect(q2.isApproved('other-task', action)).toBe(false);
+    expect(q2.isApproved(scope('task-9'), action)).toBe(true);
+    expect(q2.isApproved(scope('task-9'), { action: 'click', ref: 'e9' })).toBe(false);
+    expect(q2.isApproved(scope('other-task'), action)).toBe(false);
+  });
+
+  it('rejects approvals when ANY argument differs (approval-scope bypass)', () => {
+    const q = tmpQueue();
+    const c = q.request('mcp:s1', action, 'r', 'high', FP);
+    q.resolve(c.id, true);
+    // Same action, same ref, DIFFERENT text -> not approved.
+    expect(
+      q.isApproved(scope('mcp:s1'), { action: 'type', ref: 'e9', text: 'different-unapproved-test' }),
+    ).toBe(false);
+    // Exact same args -> approved (and consumed).
+    expect(q.isApproved(scope('mcp:s1'), action)).toBe(true);
+  });
+
+  it('consumes approvals atomically: the same call a second time needs a fresh ticket', () => {
+    const q = tmpQueue();
+    const c = q.request('mcp:s1', action, 'r', 'high', FP);
+    q.resolve(c.id, true);
+    expect(q.isApproved(scope('mcp:s1'), action)).toBe(true);
+    expect(q.isApproved(scope('mcp:s1'), action)).toBe(false);
+  });
+
+  it('voids approvals when the page or snapshot changes', () => {
+    const q = tmpQueue();
+    const c = q.request('mcp:s1', action, 'r', 'high', FP);
+    q.resolve(c.id, true);
+    // Navigation (URL changed) voids the approval.
+    expect(q.isApproved(scope('mcp:s1', 'https://other.test/::snap-1'), action)).toBe(false);
+    // Snapshot rotation (refs reassigned) voids the approval.
+    expect(q.isApproved(scope('mcp:s1', 'https://example.test/::snap-2'), action)).toBe(false);
+  });
+
+  it('scopes approvals to the requesting session', () => {
+    const q = tmpQueue();
+    const c = q.request('mcp:session-A', action, 'r', 'high', FP);
+    q.resolve(c.id, true);
+    expect(q.isApproved(scope('mcp:session-A'), action)).toBe(true);
+    // Session B is not authorized by session A's approval.
+    expect(q.isApproved(scope('mcp:session-B'), action)).toBe(false);
+  });
+
+  it('expires approvals after the TTL', async () => {
+    const q = tmpQueue();
+    const c = q.request('mcp:s1', action, 'r', 'high', FP, { ttlMs: 5 });
+    q.resolve(c.id, true);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(q.isApproved(scope('mcp:s1'), action)).toBe(false);
+  });
+
+  it('sameAction compares full args, not just action/ref/url', () => {
+    expect(sameAction(action, { action: 'type', ref: 'e9', text: 'x' })).toBe(true);
+    expect(sameAction(action, { action: 'type', ref: 'e9', text: 'y' })).toBe(false);
+    expect(sameAction(action, { action: 'type', ref: 'e9' })).toBe(false);
+    expect(sameAction(action, { action: 'click', ref: 'e9', text: 'x' } as AgentAction)).toBe(false);
   });
 });
 

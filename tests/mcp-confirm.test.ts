@@ -92,7 +92,8 @@ describe('MCP confirmation ticket continuation (real, not promised)', () => {
     });
     expect(isErrorResult(result)).toBe(true);
     expect(textOf(result)).toContain(ticketId);
-    expect(queue.listUnresolved().filter((c) => c.taskId === 'mcp')).toHaveLength(1);
+    const scopeKey = `mcp:${transport.sessionId}`;
+    expect(queue.listUnresolved().filter((c) => c.taskId === scopeKey)).toHaveLength(1);
   });
 
   it('operator approval unblocks the retried tool (ticket continuation works)', async () => {

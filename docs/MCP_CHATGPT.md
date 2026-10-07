@@ -11,6 +11,22 @@ local agent loop (including `describeLiveTarget` for password-field context):
   `node dist/index.js approve <id> --yes` or the bridge UI "Pending
   confirmations", and the retried tool call proceeds. Gated actions stay
   gated — nothing proceeds silently.
+- **What an approval covers (exact, fail-closed):** one approval authorizes
+  ONE specific call and nothing else. It binds the canonical FULL tool
+  arguments (every argument — e.g. the exact `text` being typed, not just
+  the ref), the page/target fingerprint (`<page URL>::<snapshot id>` at
+  ticket time), and the requesting MCP session. It expires 10 minutes after
+  issuance and is **single-use**: the retry it unblocks consumes it, so the
+  same call a second time needs a fresh ticket. Navigation, or a snapshot
+  rotation (which reassigns refs), voids the approval. Approving
+  `browser_type e4 "hello"` never authorizes `browser_type e4 "goodbye"`,
+  and one session's approval never authorizes another session.
+- **What is NOT protected:** a bare "Send"/"Submit" click whose label
+  matches no consequential keyword is low-risk and proceeds without
+  confirmation; icon-only buttons with no accessible name are NOT caught by
+  the keyword heuristic. Do not treat the bridge as generally safe on
+  arbitrary websites — these gates are fixture-tested heuristics, not a
+  safety proof.
 - `browser_upload` is refused unless the absolute path is pre-approved via
   the `ABB_UPLOAD_ALLOWLIST` environment variable (comma-separated); the
   block message says exactly this.

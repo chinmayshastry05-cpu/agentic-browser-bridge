@@ -130,13 +130,18 @@ describe('MCP Streamable HTTP transport (in-process, real SDK client)', () => {
     }
   });
 
-  it('unapproved browser_upload is refused over MCP', async () => {
+  it('unapproved browser_upload is refused over MCP (honest recourse: ABB_UPLOAD_ALLOWLIST)', async () => {
+    // Contract change (2026-10-08): the old message promised UI/CLI upload
+    // approval, but no such path ever existed (approveUpload was unreachable
+    // in production). The ONLY recourse is the operator allowlist, so the
+    // message — and this test — now pin exactly that.
     const result = await client.callTool({
       name: 'browser_upload',
       arguments: { ref: 'e3', filePath: '/tmp/evil.txt' },
     });
     expect(isErrorResult(result)).toBe(true);
-    expect(textOf(result)).toMatch(/approval/i);
+    expect(textOf(result)).toMatch(/ABB_UPLOAD_ALLOWLIST/);
+    expect(textOf(result)).not.toMatch(/bridge UI/i);
   });
 });
 

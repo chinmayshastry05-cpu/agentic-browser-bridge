@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Agentic Browser bridge — local demo page</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 560px; margin: 4rem auto; padding: 0 1rem; }
+    label { display: block; margin-bottom: .5rem; font-weight: 600; }
+    input { padding: .5rem; width: 100%; box-sizing: border-box; margin-bottom: 1rem; }
+    button { padding: .6rem 1.2rem; font-size: 1rem; cursor: pointer; }
+    #greeting { margin-top: 1.5rem; font-size: 1.25rem; color: #0b5; min-height: 2rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Bridge demo page</h1>
+    <p>Type your name and press the button. The agent does this via the MCP bridge tools.</p>
+    <form id="greet-form">
+      <label for="name-input">Your name</label>
+      <input id="name-input" name="name" type="text" placeholder="e.g. Ada" autocomplete="off" />
+      <button id="greet-btn" type="submit">Greet me</button>
+    </form>
+    <div id="greeting" role="status" aria-live="polite"></div>
+  </main>
+  <script>
+    document.getElementById('greet-form').addEventListener('submit', function (e) {
+      e.preventDefault();
+      var name = document.getElementById('name-input').value.trim() || 'stranger';
+      document.getElementById('greeting').textContent = 'Hello, ' + name + '! The bridge clicked this button.';
+    });
+  </script>
+</body>
+</html>

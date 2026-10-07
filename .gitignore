@@ -1,0 +1,28 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build output
+dist/
+
+# demo artifacts (regenerated locally; never commit screenshots)
+demo/output/
+
+# test artifacts
+coverage/
+
+# env / secrets — NEVER commit real keys
+.env
+.env.*
+*.pem
+*.key
+
+# editor / os
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# logs
+*.log
+npm-debug.log*

@@ -18,12 +18,15 @@ import type {
   BrowserBackend,
   DomNode,
   DownloadRecord,
+  ElementDescriptor,
   FrameInfo,
   LLMProvider,
   PageInfo,
   PageSnapshot,
   TabInfo,
+  TargetDescription,
 } from '../src/types.js';
+import { nameSimilarity, reground, signatureMatches, similarityScore } from '../src/perception/grounding.js';
 
 /* ------------------------------------------------------------------ */
 /* Fixtures                                                            */
@@ -129,6 +132,15 @@ class MockBackend implements BrowserBackend {
   }
   async listFrames(): Promise<FrameInfo[]> { return []; }
   async frameSnapshot(_frameId: string): Promise<PageSnapshot> { throw new Error('no frames in mock'); }
+  /** Override per-test to simulate DOM drift; default mirrors the last snapshot. */
+  describeOverride: Record<string, TargetDescription | null> | null = null;
+  async describeTarget(selector: string, _frameId?: string): Promise<TargetDescription | null> {
+    if (this.describeOverride && selector in this.describeOverride) {
+      return this.describeOverride[selector];
+    }
+    const n = this.snapshotData.nodes.find((x) => x.selector === selector);
+    return n ? { role: n.role, name: n.name, tag: n.tag, visible: n.visible } : null;
+  }
   async uploadFile(selector: string, filePath: string, _frameId?: string): Promise<void> {
     this.typed.push({ selector, text: `upload:${filePath}`, submit: false });
   }
@@ -545,6 +557,134 @@ describe('session tabs and attach', () => {
 });
 
 /* ------------------------------------------------------------------ */
+/* perception/grounding.ts — stale refs and semantic re-grounding (M3)  */
+/* ------------------------------------------------------------------ */
+
+function descriptor(over: Partial<ElementDescriptor> = {}): ElementDescriptor {
+  return {
+    ref: 'e3',
+    snapshotId: 'snap-1',
+    role: 'button',
+    name: 'Greet me',
+    tag: 'button',
+    selector: '#greet',
+    ...over,
+  };
+}
+
+describe('grounding', () => {
+  it('matches identical signatures', () => {
+    expect(signatureMatches(descriptor(), { role: 'button', name: 'Greet me', tag: 'button' })).toBe(true);
+    expect(signatureMatches(descriptor(), { role: 'link', name: 'Greet me', tag: 'a' })).toBe(false);
+    expect(signatureMatches(descriptor(), { role: 'button', name: 'Farewell', tag: 'button' })).toBe(false);
+  });
+
+  it('scores name similarity by token overlap', () => {
+    expect(nameSimilarity('Greet me', 'Greet me')).toBe(1);
+    expect(nameSimilarity('Greet me now', 'Greet me')).toBeGreaterThan(0.5);
+    expect(nameSimilarity('Greet me', 'Delete everything')).toBeLessThan(0.3);
+    expect(nameSimilarity('', 'Greet me')).toBe(0);
+  });
+
+  it('re-grounds by ref when the signature still matches', () => {
+    const fresh = sampleSnapshot();
+    const r = reground(descriptor(), fresh);
+    expect(r.ok).toBe(true);
+    expect(r.method).toBe('ref-signature');
+    expect(r.confidence).toBe(1);
+  });
+
+  it('re-grounds semantically when the DOM was reordered (selector changed)', () => {
+    const fresh = sampleSnapshot();
+    // Simulate a re-render: same button, new selector and new ref position.
+    fresh.nodes = fresh.nodes.map((n) =>
+      n.ref === 'e3'
+        ? { ...n, ref: 'e9', selector: '#app > button.primary' }
+        : n,
+    );
+    const r = reground(descriptor(), fresh);
+    expect(r.ok).toBe(true);
+    expect(r.method).toBe('semantic');
+    expect(r.newRef).toBe('e9');
+    expect(r.confidence!).toBeGreaterThanOrEqual(0.7);
+  });
+
+  it('refuses when duplicate labels make the match ambiguous', () => {
+    const dup = sampleSnapshot();
+    dup.nodes = [
+      ...dup.nodes,
+      node({ ref: 'e9', role: 'button', name: 'Greet me', tag: 'button', selector: '#greet2' }),
+    ];
+    const r = reground({ ...descriptor(), ref: 'e999', selector: '#gone' }, dup);
+    expect(r.ok).toBe(false);
+    expect(r.reason).toMatch(/ambiguous/);
+    expect(r.candidates!.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('refuses when nothing resembles the descriptor', () => {
+    const empty: PageSnapshot = {
+      snapshotId: 'snap-2',
+      url: 'https://example.test/',
+      title: 'Demo',
+      capturedAt: '2026-10-07T00:00:00.000Z',
+      nodes: [node({ ref: 'e1', role: 'heading', name: 'Unrelated', tag: 'h1', selector: '#h' })],
+    };
+    const r = reground(descriptor(), empty);
+    expect(r.ok).toBe(false);
+    expect(r.reason).toMatch(/below threshold/);
+  });
+
+  it('similarityScore weights role over name', () => {
+    const d = descriptor();
+    const sameRole = node({ ref: 'e1', role: 'button', name: 'Something else', tag: 'button', selector: '#x' });
+    const diffRole = node({ ref: 'e2', role: 'link', name: 'Greet me', tag: 'a', selector: '#y' });
+    expect(similarityScore(d, sameRole)).toBeGreaterThan(similarityScore(d, diffRole));
+  });
+});
+
+describe('session resolveTarget (stale detection)', () => {
+  it('acts directly when the live target still matches', async () => {
+    const { session, backend } = makeSession();
+    await session.snapshot();
+    await session.click('e3');
+    expect(backend.clicked).toEqual(['#e3']);
+  });
+
+  it('re-grounds and acts when the DOM moved the element', async () => {
+    const { session, backend } = makeSession();
+    await session.snapshot();
+    // DOM drift: the selector no longer resolves, but a fresh snapshot has
+    // the same button under a new selector.
+    backend.describeOverride = { '#e3': null };
+    backend.snapshotData = {
+      ...sampleSnapshot(),
+      nodes: sampleSnapshot().nodes.map((n) =>
+        n.ref === 'e3' ? { ...n, selector: '#app > button.primary' } : n,
+      ),
+    };
+    await session.click('e3');
+    expect(backend.clicked).toEqual(['#app > button.primary']);
+  });
+
+  it('throws instead of guessing when re-grounding is ambiguous', async () => {
+    const { session, backend } = makeSession();
+    await session.snapshot();
+    backend.describeOverride = { '#e3': null };
+    const dup = sampleSnapshot();
+    backend.snapshotData = {
+      ...dup,
+      nodes: [
+        ...dup.nodes.filter((n) => n.ref !== 'e3'),
+        node({ ref: 'e8', role: 'button', name: 'Greet me', tag: 'button', selector: '#g1' }),
+        node({ ref: 'e9', role: 'button', name: 'Greet me', tag: 'button', selector: '#g2' }),
+      ],
+    };
+    await expect(session.click('e3')).rejects.toThrow(/stale element ref/);
+    expect(backend.clicked).toEqual([]);
+  });
+});
+
+/* ------------------------------------------------------------------ */
 /* bridge-core session ref handling                                     */
 /* ------------------------------------------------------------------ */
 
@@ -556,13 +696,28 @@ describe('browser session', () => {
     await session.click('e1');
     expect(backend.clicked).toEqual(['#e1']);
 
-    // A new snapshot with different selectors invalidates old refs.
+    // A new snapshot with a different selector for the same element:
+    // the ref still works because the semantic signature matches.
     backend.snapshotData = {
       ...sampleSnapshot(),
-      nodes: [node({ ref: 'e1', role: 'button', name: 'Other', tag: 'button', selector: '#other' })],
+      nodes: [node({ ref: 'e1', role: 'heading', name: 'Welcome', tag: 'h1', selector: '#other' })],
     };
     await session.snapshot();
     await session.click('e1');
     expect(backend.clicked[1]).toBe('#other');
+  });
+
+  it('refuses to act when the element behind a ref changed identity', async () => {
+    const { session, backend } = makeSession();
+    await session.snapshot();
+    // DOM changes after the snapshot: e1's heading is replaced by different content.
+    backend.snapshotData = {
+      ...sampleSnapshot(),
+      nodes: sampleSnapshot().nodes.map((n) =>
+        n.ref === 'e1' ? { ...n, name: 'Something else entirely' } : n,
+      ),
+    };
+    await expect(session.click('e1')).rejects.toThrow(/stale element ref/);
+    expect(backend.clicked).toEqual([]);
   });
 });

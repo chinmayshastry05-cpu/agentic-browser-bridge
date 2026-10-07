@@ -221,4 +221,23 @@ describe('M2 browser tool surface (real headless Chromium)', () => {
       await session.close();
     }
   }, 60_000);
+
+  it('re-grounds a stale ref after the element is replaced', async () => {
+    const session = await makeSession();
+    try {
+      const swapRef = refByName(session, 'Swap me');
+      await session.click(swapRef); // replaces the button node (new selector)
+      expect(await session.pageText()).toContain('swaps: 1');
+
+      // The old ref's selector is gone; grounding must find the replacement
+      // by semantic match and click it — not throw, not click blindly.
+      const target = await session.resolveTarget(swapRef);
+      expect(target.regrounded).toBe(true);
+      expect(target.confidence).toBeGreaterThanOrEqual(0.7);
+      await session.click(swapRef);
+      expect(await session.pageText()).toContain('swaps: 2');
+    } finally {
+      await session.close();
+    }
+  }, 60_000);
 });

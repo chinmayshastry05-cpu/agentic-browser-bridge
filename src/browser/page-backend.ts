@@ -441,6 +441,92 @@ export abstract class PageBackendBase implements BrowserBackend {
     return captureSnapshot(this.requirePage());
   }
 
+  async describeTarget(
+    selector: string,
+    frameId?: string,
+  ): Promise<import('../types.js').TargetDescription | null> {
+    const { page, frame } = this.frameFor(frameId);
+    const scope = frame ?? page;
+    const locator = scope.locator(selector).first();
+    let count = 0;
+    try {
+      count = await locator.count();
+    } catch {
+      return null;
+    }
+    if (count === 0) return null;
+    try {
+      return await locator.evaluate((el) => {
+        const tag = el.tagName.toLowerCase();
+        const explicit = el.getAttribute('role');
+        let role = explicit ? explicit.toLowerCase() : tag;
+        if (!explicit) {
+          if (tag === 'a') role = 'link';
+          else if (tag === 'button') role = 'button';
+          else if (tag === 'input') {
+            const t = (el.getAttribute('type') ?? 'text').toLowerCase();
+            role =
+              t === 'checkbox'
+                ? 'checkbox'
+                : t === 'radio'
+                  ? 'radio'
+                  : t === 'submit' || t === 'button'
+                    ? 'button'
+                    : 'textbox';
+          } else if (tag === 'select') role = 'combobox';
+          else if (tag === 'textarea') role = 'textbox';
+          else if (/^h[1-6]$/.test(tag)) role = 'heading';
+          else if (tag === 'img') role = 'img';
+        }
+        let name = '';
+        const aria = el.getAttribute('aria-label');
+        if (aria) name = aria.trim();
+        else if (el instanceof HTMLImageElement && el.alt) name = el.alt.trim();
+        else if (
+          el instanceof HTMLInputElement ||
+          el instanceof HTMLTextAreaElement ||
+          el instanceof HTMLSelectElement
+        ) {
+          if (el instanceof HTMLInputElement && el.placeholder) name = el.placeholder.trim();
+          else {
+            const labels = (el as HTMLInputElement).labels;
+            if (labels && labels.length > 0 && labels[0].textContent) {
+              if (el instanceof HTMLInputElement) {
+                name = (labels[0].textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 120);
+              } else {
+                // Mirror the walker: label's own text nodes, not nested control text.
+                const labelText = Array.from(labels[0].childNodes)
+                  .filter((n) => n.nodeType === 3)
+                  .map((n) => n.textContent ?? '')
+                  .join(' ')
+                  .replace(/\s+/g, ' ')
+                  .trim();
+                name = (labelText || (labels[0].textContent ?? '').replace(/\s+/g, ' ').trim()).slice(0, 120);
+              }
+            }
+          }
+          if (!name) name = (el.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 120);
+        } else {
+          name = (el.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 120);
+        }
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return {
+          role,
+          name,
+          tag,
+          visible:
+            rect.width > 0 &&
+            rect.height > 0 &&
+            style.visibility !== 'hidden' &&
+            style.display !== 'none',
+        };
+      });
+    } catch {
+      return null;
+    }
+  }
+
   async screenshot(path: string): Promise<void> {
     await this.requirePage().screenshot({ path, fullPage: false });
   }

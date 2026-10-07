@@ -35,9 +35,11 @@
     <span id="file-chosen"></span><br>
     <button id="greet" type="button">Greet me</button>
     <button id="dbl" type="button">Double-click me</button>
+    <button id="swap" type="button">Swap me</button>
   </form>
   <p id="greeting" aria-live="polite"></p>
   <p id="dbl-count">double-clicks: 0</p>
+  <p id="swap-count">swaps: 0</p>
 
   <div id="delayed">I appeared after a delay.</div>
 
@@ -61,6 +63,24 @@
   document.getElementById('dbl').addEventListener('dblclick', () => {
     dbls += 1;
     document.getElementById('dbl-count').textContent = 'double-clicks: ' + dbls;
+  });
+  // Stale-element case: the button replaces itself (new node, new selector)
+  // after the first click. Same accessible name, different identity.
+  let swaps = 0;
+  const bumpSwaps = () => {
+    swaps += 1;
+    document.getElementById('swap-count').textContent = 'swaps: ' + swaps;
+  };
+  document.getElementById('swap').addEventListener('click', () => {
+    bumpSwaps();
+    if (swaps === 1) {
+      const replacement = document.createElement('button');
+      replacement.id = 'swap-v2';
+      replacement.type = 'button';
+      replacement.textContent = 'Swap me';
+      replacement.addEventListener('click', bumpSwaps);
+      document.getElementById('swap').replaceWith(replacement);
+    }
   });
   setTimeout(() => { document.getElementById('delayed').style.display = 'block'; }, 1500);
   document.getElementById('avatar').addEventListener('change', (e) => {

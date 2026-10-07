@@ -24,6 +24,7 @@ import {
   type BrowserBackend,
   type BrowserStartOptions,
   type DownloadRecord,
+  type ElementDescriptor,
   type FrameInfo,
   type PageInfo,
   type PageSnapshot,
@@ -31,8 +32,17 @@ import {
 } from './types.js';
 import { PlaywrightBackend } from './browser/playwright-backend.js';
 import { CdpBackend } from './browser/cdp-backend.js';
+import { reground, signatureMatches } from './perception/grounding.js';
 
 export { PlaywrightBackend, CdpBackend };
+
+export interface ResolvedTarget {
+  selector: string;
+  frameId?: string;
+  /** 1.0 when the ref was fresh; lower when re-grounded. */
+  confidence: number;
+  regrounded: boolean;
+}
 
 /**
  * BrowserSession — one named agent-driven browser session.
@@ -45,7 +55,7 @@ export { PlaywrightBackend, CdpBackend };
 export class BrowserSession {
   readonly id: string;
   private readonly backend: BrowserBackend;
-  private targetByRef = new Map<string, { selector: string; frameId?: string }>();
+  private targetByRef = new Map<string, { descriptor: ElementDescriptor; selector: string; frameId?: string }>();
   private lastSnapshot: PageSnapshot | null = null;
 
   constructor(id: string, backend: BrowserBackend = new PlaywrightBackend()) {
@@ -131,12 +141,22 @@ export class BrowserSession {
   private registerSnapshot(snap: PageSnapshot): void {
     this.targetByRef.clear();
     for (const n of snap.nodes) {
-      this.targetByRef.set(n.ref, { selector: n.selector, frameId: n.frameId });
+      const descriptor: ElementDescriptor = {
+        ref: n.ref,
+        snapshotId: snap.snapshotId,
+        frameId: n.frameId,
+        role: n.role,
+        name: n.name,
+        tag: n.tag,
+        selector: n.selector,
+        text: n.text,
+      };
+      this.targetByRef.set(n.ref, { descriptor, selector: n.selector, frameId: n.frameId });
     }
     this.lastSnapshot = snap;
   }
 
-  private targetFor(ref: string): { selector: string; frameId?: string } {
+  private targetFor(ref: string): { descriptor: ElementDescriptor; selector: string; frameId?: string } {
     const t = this.targetByRef.get(ref);
     if (!t) {
       throw new Error(
@@ -146,23 +166,60 @@ export class BrowserSession {
     return t;
   }
 
-  async click(ref: string): Promise<void> {
+  /**
+   * Resolve a ref to a live target, detecting staleness.
+   *
+   * 1. Describe the live element behind the stored selector; if its signature
+   *    still matches the descriptor, act directly (confidence 1.0).
+   * 2. Otherwise take a fresh snapshot and attempt semantic re-grounding.
+   * 3. If re-grounding is ambiguous or fails, throw — the caller must
+   *    re-observe. We never act on a guess.
+   */
+  async resolveTarget(ref: string): Promise<ResolvedTarget> {
     const t = this.targetFor(ref);
+    let live: import('./types.js').TargetDescription | null = null;
+    try {
+      live = await this.backend.describeTarget(t.selector, t.frameId);
+    } catch {
+      live = null;
+    }
+    if (live && signatureMatches(t.descriptor, live)) {
+      return { selector: t.selector, frameId: t.frameId, confidence: 1, regrounded: false };
+    }
+    const fresh = await this.snapshot();
+    const result = reground(t.descriptor, fresh);
+    if (!result.ok) {
+      throw new Error(
+        `stale element ref "${ref}" ("${t.descriptor.name}") and re-grounding failed: ${result.reason}. ` +
+          `Take a fresh browser_snapshot and pick a new ref.`,
+      );
+    }
+    const nt = this.targetFor(result.newRef!);
+    return {
+      selector: nt.selector,
+      frameId: nt.frameId,
+      confidence: result.confidence ?? 0,
+      regrounded: true,
+    };
+  }
+
+  async click(ref: string): Promise<void> {
+    const t = await this.resolveTarget(ref);
     await this.backend.click(t.selector, t.frameId);
   }
 
   async dblclick(ref: string): Promise<void> {
-    const t = this.targetFor(ref);
+    const t = await this.resolveTarget(ref);
     await this.backend.dblclick(t.selector, t.frameId);
   }
 
   async type(ref: string, text: string, submit = false): Promise<void> {
-    const t = this.targetFor(ref);
+    const t = await this.resolveTarget(ref);
     await this.backend.type(t.selector, text, submit, t.frameId);
   }
 
   async clear(ref: string): Promise<void> {
-    const t = this.targetFor(ref);
+    const t = await this.resolveTarget(ref);
     await this.backend.clear(t.selector, t.frameId);
   }
 
@@ -171,27 +228,27 @@ export class BrowserSession {
   }
 
   async hover(ref: string): Promise<void> {
-    const t = this.targetFor(ref);
+    const t = await this.resolveTarget(ref);
     await this.backend.hover(t.selector, t.frameId);
   }
 
   async focus(ref: string): Promise<void> {
-    const t = this.targetFor(ref);
+    const t = await this.resolveTarget(ref);
     await this.backend.focus(t.selector, t.frameId);
   }
 
   async scrollIntoView(ref: string): Promise<void> {
-    const t = this.targetFor(ref);
+    const t = await this.resolveTarget(ref);
     await this.backend.scrollIntoView(t.selector, t.frameId);
   }
 
   async selectOption(ref: string, values: string[]): Promise<string[]> {
-    const t = this.targetFor(ref);
+    const t = await this.resolveTarget(ref);
     return this.backend.selectOption(t.selector, values, t.frameId);
   }
 
   async setChecked(ref: string, checked: boolean): Promise<void> {
-    const t = this.targetFor(ref);
+    const t = await this.resolveTarget(ref);
     await this.backend.setChecked(t.selector, checked, t.frameId);
   }
 
@@ -209,7 +266,7 @@ export class BrowserSession {
 
   async pageText(ref?: string): Promise<string> {
     if (!ref) return this.backend.pageText();
-    const t = this.targetFor(ref);
+    const t = await this.resolveTarget(ref);
     return this.backend.pageText(t.selector, t.frameId);
   }
 
@@ -222,7 +279,7 @@ export class BrowserSession {
   }
 
   async uploadFile(ref: string, filePath: string): Promise<{ uploaded: string; to: string }> {
-    const t = this.targetFor(ref);
+    const t = await this.resolveTarget(ref);
     await this.backend.uploadFile(t.selector, filePath, t.frameId);
     return { uploaded: filePath, to: ref };
   }

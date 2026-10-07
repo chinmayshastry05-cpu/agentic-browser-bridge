@@ -149,6 +149,11 @@ export interface BrowserBackend {
   /** Snapshot scoped to one frame; refs carry that frame's id. */
   frameSnapshot(frameId: string): Promise<PageSnapshot>;
   /**
+   * Describe the live element currently behind a selector (for staleness
+   * checks). Returns null when nothing resolves.
+   */
+  describeTarget(selector: string, frameId?: string): Promise<TargetDescription | null>;
+  /**
    * Upload a local file through a file input. The path must be absolute and
    * exist; the caller (policy layer) is responsible for user approval.
    */
@@ -173,6 +178,29 @@ export interface BrowserAttachOptions {
   /** CDP HTTP endpoint, e.g. "http://127.0.0.1:9222". */
   cdpEndpoint: string;
   navigationTimeoutMs?: number;
+}
+
+/** A live element's observable signature, used for staleness checks. */
+export interface TargetDescription {
+  role: string;
+  name: string;
+  tag: string;
+  visible: boolean;
+}
+
+/**
+ * Semantic signature binding a ref to what it meant at snapshot time.
+ * Used by the grounding layer to detect stale refs and re-ground safely.
+ */
+export interface ElementDescriptor {
+  ref: string;
+  snapshotId: string;
+  frameId?: string;
+  role: string;
+  name: string;
+  tag: string;
+  selector: string;
+  text?: string;
 }
 
 /** One browser tab/page known to the backend. */

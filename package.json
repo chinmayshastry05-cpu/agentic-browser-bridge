@@ -6,12 +6,12 @@
     "ws": "^8.22.0",
     "zod": "^4.6.5"
   },
-  "description": "Agentic Browser bridge \u2014 an original, local-first MCP bridge that lets an AI agent observe, plan, and act inside a real browser session.",
+  "description": "Agentic Browser bridge — an original, local-first MCP bridge that lets an AI agent observe, plan, and act inside a real browser session.",
   "devDependencies": {
     "@types/node": "^22.10.2",
     "@types/ws": "^8.18.2",
     "typescript": "^5.7.2",
-    "vitest": "^2.1.8"
+    "vitest": "^4.1.11"
   },
   "engines": {
     "node": ">=18"
@@ -27,6 +27,7 @@
     "build": "tsc -p tsconfig.json",
     "demo": "npm run build && node dist/demo/demo.js",
     "serve": "npm run build && node dist/src/index.js serve",
+    "package-extension": "node scripts/package-extension.mjs",
     "test": "vitest run",
     "mcp": "npm run build && node dist/src/index.js mcp --transport",
     "mcp-stdio": "npm run build && node dist/src/index.js mcp --transport stdio"

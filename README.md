@@ -55,7 +55,8 @@ An agent can't click what it can't see. This bridge gives it eyes and hands:
   MCP server: `node dist/src/index.js mcp --transport stdio|http` exposes the
   30 bridge tools over MCP (stdio for local clients, Streamable HTTP on
   127.0.0.1:8933 for remote). HTTP requires a bearer token when not
-  loopback-bound. See docs/MCP_CHATGPT.md (incl. ChatGPT plan limits).
+  loopback-bound. See docs/MCP_CHATGPT.md (ChatGPT setup and authentication
+  options).
 ```
 
 Key modules: `src/browser/` (backends, snapshot walker), `src/perception/`

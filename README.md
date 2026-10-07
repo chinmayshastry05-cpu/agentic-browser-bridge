@@ -186,6 +186,10 @@ demo/            bundled offline demo page
 
 ## Test evidence (this checkout)
 
+Note: the browser-backed tests (`browser.test.ts`, `cdp.test.ts`) require the
+one-time `npx playwright install chromium` download first (see the Install
+section above); run it before `npm test`.
+
 ```
 npm run build   PASS (tsc strict, zero errors)
 npm test        PASS — 86/86 across 6 files:

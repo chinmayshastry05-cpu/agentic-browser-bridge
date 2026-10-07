@@ -27,7 +27,6 @@ beforeAll(async () => {
     if (req.url === '/v1.html') {
       res.writeHead(200, { 'content-type': 'text/html' });
       res.end(fixture('v1.html'));
-      res.end(fixture('v1.html'));
     } else if (req.url === '/frame.html') {
       res.writeHead(200, { 'content-type': 'text/html' });
       res.end(fixture('frame.html'));

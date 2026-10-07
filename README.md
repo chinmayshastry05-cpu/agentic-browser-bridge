@@ -1,137 +1,213 @@
 # Agentic Browser bridge
 
-A local-first **MCP bridge** that lets an AI agent observe, plan, and act inside a real browser session: **observe → plan → act**, over JSON-RPC + SSE.
+A local-first **browser agent bridge**: an AI agent observes a real browser
+session, plans one safe action at a time, verifies the effect, and asks for
+approval before anything consequential — over JSON-RPC + SSE, with a minimal
+local UI.
 
-> **Originality note:** this is a new, original implementation written from scratch for this project. It is **not** a copy of any third-party "Agentic Browser" project or repository. A friend shared only a verbal architecture explanation; every line of code here was written fresh, and no external source archive was used.
+> **Originality note:** original implementation written from scratch for this
+> project. No third-party "agentic browser" code is reused.
 
 ## What it is
 
 An agent can't click what it can't see. This bridge gives it eyes and hands:
 
-- **Eyes** — `browser_snapshot` captures the page as a compact element tree: every interactable element gets a short stable ref (`[e3]`) plus role, accessible name, and a unique selector.
-- **Brain** — `agent-loop.ts` runs observe → plan → act: snapshot → analyze → ask the LLM for the next JSON action → execute it. The LLM side is a pluggable provider interface; the shipped `OpenAIAdapter` speaks the OpenAI Chat Completions API (and any OpenAI-compatible endpoint).
-- **Hands** — MCP tools `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_screenshot`, served over a tiny local HTTP server (`server.ts`) as JSON-RPC 2.0 (`POST /rpc`) with a Server-Sent Events stream (`GET /events`) for live step updates.
+- **Eyes** — `browser_snapshot` captures the page as an element tree: every
+  interactable element gets a short ref (`[e3]`) plus role, accessible name,
+  selector, and frame context. Open shadow roots are pierced; iframes are
+  inspectable via `browser_frame_snapshot`.
+- **Brain** — `src/agent/agent-loop.ts` runs observe → plan → **check**
+  (policy gate) → act → **verify**. Refs are grounded: before acting, the
+  live element is re-described and compared to its snapshot signature; stale
+  refs are re-grounded semantically or refused — never guessed.
+- **Hands** — 30 `browser_*` tools (navigate, click, type, select, check,
+  press key, scroll, wait, tabs, frames, upload, download tracking,
+  screenshots, …) served by a tiny local HTTP server as JSON-RPC 2.0
+  (`POST /rpc`) with SSE (`GET /events`) and a status UI (`GET /ui`).
+- **Memory** — every run is a persisted task (JSON, `~/.agentic-browser-bridge/tasks/`);
+  interrupted tasks resume with `agent --resume <taskId>`. Typed text is
+  redacted before anything is written to disk.
+- **Conscience** — a policy engine classifies actions low/medium/high risk;
+  high-risk actions (e.g. typing into password fields) stop the loop with
+  `awaiting_confirmation` until the operator approves via CLI or UI.
 
-## How it works
+## Architecture
 
 ```
-┌─────────────┐   POST /rpc (JSON-RPC)    ┌──────────────────────┐
-│  MCP client │ ───────────────────────▶ │  BridgeServer        │
-│  or agent   │ ◀─────────────────────── │  server.ts           │
-└─────────────┘   GET /events (SSE)      │   ├─ SessionManager  │
-                                         │   ├─ tool registry │
-                                         │   │   tools.ts     │
-                                         └───────┬──────────────┘
-                                                 │ refs, selectors
-                                         ┌───────▼──────────────┐
-                                         │  BrowserSession      │
-                                         │  bridge-core.ts      │
-                                         │   ├─ analyzer.ts ────┼─▶ summary for planner
-                                         │   └─ tree.ts ────────┼─▶ navigable element tree
-                                         └───────┬──────────────┘
-                                                 │ Playwright
-                                         ┌───────▼──────────────┐
-                                         │  Chromium (local)    │
-                                         └──────────────────────┘
+                    ┌─────────────────────────────────────────┐
+                    │  BridgeServer (server.ts)               │
+  MCP client ──rpc─▶│   sessions · tools · /ui · /api         │──▶ TaskStore (JSON)
+                    └──────────────┬──────────────────────────┘    ConfirmationQueue
+                                   │ refs + grounding                     (file-backed)
+                    ┌──────────────▼──────────────┐
+                    │  BrowserSession             │
+                    │  resolveTarget(): verify →  │
+                    │  re-ground → or refuse      │
+                    └──────────────┬──────────────┘
+                    ┌──────────────▼──────────────┐
+                    │  BrowserBackend             │
+                    │  ├── PlaywrightBackend      │  launched isolated Chromium
+                    │  └── CdpBackend             │  user's Chrome/Edge over CDP
+                    └─────────────────────────────┘
+  AgentLoop: OBSERVE → PLAN → CHECK(policy) → ACT → VERIFY → recover (≤1 retry)
 ```
 
-Per step, `AgentLoop`:
-1. **Observe** — `session.snapshot()` walks the DOM in-page (`page.evaluate`), assigns `data-abb-ref` attributes, and returns nodes with unique CSS selectors. `analyzer.ts` condenses this to a one-paragraph brief; `tree.ts` renders the indented tree the planner sees.
-2. **Plan** — the provider (`openai.ts`) is asked for exactly one JSON action (`navigate`/`click`/`type`/`screenshot`/`snapshot`/`finish`/`noop`).
-3. **Act** — the action executes against the session; refs resolve to selectors recorded at snapshot time (stale refs are rejected with a clear error).
+Key modules: `src/browser/` (backends, snapshot walker), `src/perception/`
+(grounding), `src/agent/` (loop, verifier), `src/security/` (policy,
+confirmations, redaction, injection), `src/state/` (task store).
 
-### Why plain `playwright` instead of `@playwright/mcp`?
+## Install
 
-Three reasons, documented here and in `src/bridge-core.ts`:
+Prerequisites: Node.js ≥ 18. (`npm` is used below; the repo also ships a
+`pnpm` workspace file.)
 
-1. The bridge runs the browser **in-process** and exposes its **own** MCP-style tool layer — the external `@playwright/mcp` server would be a redundant hop.
-2. We need **per-snapshot stable element refs** (`e1`, `e2`, …) that survive across our observe → plan → act loop; an in-page DOM walk gives us exactly the refs, roles, and selectors our analyzer/tree modules consume.
-3. Fewer moving parts for a local-only bridge: one process, one browser dependency.
+```bash
+git clone https://github.com/chinmayshastry05-cpu/agentic-browser-bridge
+cd agentic-browser-bridge
+npm install
+npx playwright install chromium   # one-time browser download
+npm run build                     # tsc strict, zero errors
+npm test                          # 86 tests (unit + real headless Chromium + real CDP)
+node dist/src/index.js doctor     # setup checks
+```
+
+## First run
+
+```bash
+# 1. Local demo (no keys, no network): observe → plan → act on a bundled page
+npm run demo
+
+# 2. Bridge server + UI
+node dist/src/index.js serve --port 8931
+# open http://127.0.0.1:8931/ui   (sessions, tasks, pending confirmations)
+
+# 3. Status / tasks
+node dist/src/index.js status
+node dist/src/index.js tasks
+```
+
+## Connect your real browser (Chrome/Edge)
+
+The bridge never scans for or silently attaches to browsers. You start the
+connection explicitly:
+
+```bash
+# 1. Start Chrome with remote debugging (your normal profile):
+chrome --remote-debugging-port=9222 --user-data-dir=/path/to/your/profile
+
+# 2. Attach a bridge session to it (only loopback endpoints are accepted):
+curl -s -X POST localhost:8931/rpc -d '{
+  "jsonrpc":"2.0","id":1,"method":"session/create","params":{"headless":true}}'
+# -> {"result":{"sessionId":"sess-1"}}
+curl -s -X POST localhost:8931/rpc -d '{
+  "jsonrpc":"2.0","id":2,"method":"session/attach",
+  "params":{"sessionId":"sess-1","cdpEndpoint":"http://127.0.0.1:9222"}}'
+
+# 3. See your real tabs and act on one:
+curl -s -X POST localhost:8931/rpc -d '{
+  "jsonrpc":"2.0","id":3,"method":"tools/call",
+  "params":{"sessionId":"sess-1","name":"browser_tabs","arguments":{}}}'
+```
+
+Disconnecting (`session/close`) never closes your browser — the bridge just
+drops the CDP connection. Connection state is always visible via
+`browser_status` and the `/ui` page.
+
+## Example task (needs `OPENAI_API_KEY`)
+
+```bash
+export OPENAI_API_KEY="..."   # env only — never committed, never logged
+node dist/src/index.js agent --goal "Open https://example.com and summarize the page" --max-steps 12
+# strict mode: confirm even medium-risk actions
+node dist/src/index.js agent --goal "..." --strict
+# approve a pending high-risk action, then resume:
+node dist/src/index.js approve confirm-xxxxxxxx --yes
+node dist/src/index.js agent --resume task-xxxxxxxx
+```
+
+## Security model
+
+- **Local-first.** The server binds `127.0.0.1` by default; no telemetry, no
+  cloud calls except the LLM provider you configure. What listens, what can
+  connect, and what leaves the machine is documented here — nothing else.
+- **Explicit browser authorization.** CDP attach requires a user-supplied
+  loopback endpoint; the bridge never launches, scans for, or closes your
+  browser.
+- **Untrusted page content.** The planner is instructed that page text is
+  data, never instructions; a detector flags injection shapes
+  (instruction override, fake system prompts, exfiltration, credential
+  harvesting) and injects a SECURITY NOTICE into the planner message.
+- **Secrets.** Typed text is redacted in persisted task steps; planner-bound
+  summaries are scrubbed for API keys/tokens/card numbers; provider keys
+  come only from the environment.
+- **Risky actions.** Low/medium/high classification; high-risk actions
+  (password fields, etc.) require operator approval via CLI or UI. The model
+  cannot approve its own actions. Uploads need an existing absolute path;
+  downloads land in a bridge-controlled directory with safe filenames.
+
+## Limitations (honest)
+
+- **Closed shadow DOM is not accessible** — a hard browser boundary, not a bug.
+- **Visual grounding is partial.** Screenshots are captured and attached to
+  task state, but there is no vision model mapping pixels to grounded
+  candidates yet; when DOM grounding is insufficient the agent re-observes
+  via snapshot. Do not rely on pixel-level control.
+- **Existing-browser connection is CDP-based**, not an extension: you must
+  start Chrome/Edge with `--remote-debugging-port` yourself. No extension is
+  shipped in v1.
+- **Verification is best-effort.** Actions without a reliable observable
+  signal (hover, scroll) are reported as *unverified*, never faked. The loop
+  records this honestly for the planner.
+- **No CAPTCHA solving, no bot-detection evasion, no auth bypass** — out of
+  scope, documented as future work.
+- **Single-user, single-machine.** No multi-user auth on the bridge itself;
+  anyone who can reach localhost can drive it — keep it on loopback.
+- **The LLM provider is required for autonomous runs** and is the only
+  network call the agent makes; everything else is local and deterministic.
 
 ## Project layout
 
 ```
 src/
-  bridge-core.ts   Session + transport abstraction over the browser backend
-                   (BrowserBackend interface; PlaywrightBackend; BrowserSession;
-                   SessionManager). Backend-agnostic: implement BrowserBackend
-                   to drive a different automation stack.
-  analyzer.ts      Snapshot → planner-friendly summary (role counts, outline,
-                   ranked interactables) + findByName/findByRole helpers.
-  tree.ts          Flat snapshot nodes → navigable element tree; text renderer.
-  openai.ts        Pluggable LLM provider. Key comes ONLY from the environment
-                   (OPENAI_API_KEY); never hardcoded, never logged.
-  agent-loop.ts    The observe → plan → act loop (provider-agnostic).
-  tools.ts         MCP tool registry: the five browser_* tools + JSON schemas.
-  server.ts        Local HTTP bridge server: JSON-RPC 2.0 + SSE.
-  index.ts         CLI: serve | demo | agent.
-  demo-lib.ts      Shared end-to-end demo logic.
-  types.ts         Shared types.
-demo/
-  page.html        Bundled offline demo page (no network needed).
-  demo.ts          `pnpm demo` entry — drives page.html headless end to end.
-tests/
-  mcp.test.ts      22 offline unit tests (mock backend, stubbed fetch).
-config/
-  bridge.config.example.json   Example config — placeholders only, no secrets.
+  browser/       backends (playwright/cdp), snapshot walker, tab/frame logic
+  perception/    grounding.ts — stale detection + semantic re-grounding
+  agent/         agent-loop.ts, verifier.ts
+  security/      policy.ts, confirm.ts, redact.ts, injection.ts
+  state/         task-store.ts — JSON task persistence + resume
+  server.ts      JSON-RPC/SSE server + /ui + /api
+  tools.ts       30 browser_* tool definitions
+  index.ts       CLI: serve|demo|agent|approve|status|doctor|tasks
+tests/           unit (mock) + real headless Chromium + real CDP attach
+tests/fixtures/  deterministic fixture pages (forms, frames, shadow DOM,
+                 delayed/stale elements, upload, download, injection)
+docs/ACCEPTANCE.md  acceptance suite A–P mapped to tests and evidence
+demo/            bundled offline demo page
 ```
 
-## Quickstart
+## Test evidence (this checkout)
 
-Prerequisites: Node.js ≥ 18 and `pnpm` (or `npm`). Playwright downloads its bundled Chromium on first use (`pnpm exec playwright install chromium`) — or reuse an existing `~/.cache/ms-playwright`.
-
-```bash
-pnpm install
-pnpm build        # type-check + compile to dist/
-pnpm test         # 22 offline unit tests
-pnpm demo         # headless end-to-end demo (see below)
+```
+npm run build   PASS (tsc strict, zero errors)
+npm test        PASS — 86/86 across 6 files:
+                  mcp.test.ts (47): analyzer, tree, tools, agent loop,
+                    provider, server RPC, tabs/attach, grounding, verifier,
+                    recovery + terminal states
+                  browser.test.ts (10): real headless Chromium — forms,
+                    keyboard/scroll, delayed content, iframe, shadow DOM,
+                    upload, download tracking, page info, stale re-grounding,
+                    scripted end-to-end loop run
+                  cdp.test.ts (3): real standalone Chromium over CDP —
+                    attach, tab enumeration/control, snapshot, screenshot,
+                    non-loopback refusal, browser survives disconnect
+                  security.test.ts (15): policy, confirmations, redaction,
+                    injection shapes + adversarial fixture, loop wiring
+                  state.test.ts (7): task store, redaction on disk, resume
+                  server-ui.test.ts (4): /ui page, task/confirmation APIs
+npm run demo    PASS — observe/plan/act on the bundled page, greeting verified
 ```
 
-### The local demo
-
-`pnpm demo` launches headless Chromium, opens the bundled `demo/page.html` via `file://`, snapshots the page, types `Ada` into the name field, clicks **Greet me**, re-snapshots to verify the greeting text appeared, and saves `demo/output/demo-screenshot.png`. Fully offline — no API keys, no network.
-
-### The bridge server
-
-```bash
-pnpm serve -- --port 8931            # JSON-RPC at POST /rpc, SSE at GET /events
-curl localhost:8931/health
-```
-
-JSON-RPC methods: `session/create`, `session/close`, `tools/list`, `tools/call`.
-
-```bash
-# create a session
-curl -s -X POST localhost:8931/rpc \
-  -d '{"jsonrpc":"2.0","id":1,"method":"session/create","params":{"headless":true}}'
-# list tools
-curl -s -X POST localhost:8931/rpc \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"sessionId":"sess-1"}}'
-# navigate + snapshot
-curl -s -X POST localhost:8931/rpc \
-  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"sessionId":"sess-1","name":"browser_navigate","arguments":{"url":"https://example.com"}}}'
-```
-
-### The autonomous agent loop (needs an LLM key)
-
-```bash
-export OPENAI_API_KEY="YOUR_API_KEY"   # never commit this; env only
-pnpm agent -- --goal "Open the demo page and trigger the greeting" --max-steps 12
-```
-
-`openai.ts` also accepts `baseUrl` for any OpenAI-compatible endpoint and a custom `apiKeyEnv` if you prefer a different variable name.
-
-### Configuration
-
-Copy `config/bridge.config.example.json` to `config/bridge.config.json` and adjust. The example uses placeholders like `YOUR_MODEL_NAME` — put **no real keys** in it (the `.gitignore` excludes real `.env` files anyway).
-
-## Security notes
-
-- **No secrets in this repo.** API keys are read from environment variables at runtime only. Config examples contain placeholders. Nothing is logged that could contain a key (the adapter sends it solely in the `Authorization` header).
-- The server binds to `127.0.0.1` by default — local only. Do not expose it to the internet without adding authentication.
-- `browser_navigate` refuses non-web schemes (`javascript:`, etc.).
-- This tool drives a real browser: only point it at pages you trust, and never use it to exfiltrate credentials or personal data.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+Real-user browser validation (§20) was demonstrated 2026-10-07: standalone
+Chromium launched with `--remote-debugging-port` (not via Playwright) →
+bridge attached over CDP → enumerated real tabs → scripted agent loop
+observed, typed, clicked → visible change verified ("Status for Ada:
+shipped", before/after screenshots) → browser survived disconnect.

@@ -8,11 +8,15 @@
  * Risk classification:
  *   low    read-only or reversible navigation: snapshot, screenshot, get_text,
  *          page_info, tabs, frames, scroll, hover, focus, navigate, back,
- *          forward, reload, wait_for
+ *          forward, reload, wait_for, clicks on innocuous labels
  *   medium ordinary state changes: type, clear, select_option, check,
  *          double_click, press_key, upload, tab open/close/switch
  *   high   consequential or credential-adjacent: typing into password fields,
- *          uploads of not-yet-approved files, anything in highRiskActions
+ *          uploads of not-yet-approved files, anything in highRiskActions,
+ *          clicks whose target label matches a consequential keyword
+ *          (buy/purchase/pay/checkout/place order/subscribe/delete/remove/
+ *          transfer/withdraw/send money — heuristic TEXT matching only;
+ *          icon-only buttons with no accessible name are NOT caught)
  *
  * High-risk actions require explicit user confirmation by default. The model
  * can never approve its own risky action: a "confirm" verdict stops the loop
@@ -30,6 +34,11 @@ export interface PolicyContext {
   inputType?: string;
   /** The target element's role. */
   targetRole?: string;
+  /**
+   * The target control's accessible name / visible text (for click /
+   * double_click). Resolved from the snapshot registry at decision time.
+   */
+  targetText?: string;
   /** Local file path for upload actions. */
   filePath?: string;
 }
@@ -54,6 +63,38 @@ const MEDIUM_ACTIONS: Set<AgentAction['action']> = new Set([
   'double_click',
   'press_key',
 ]);
+
+/**
+ * Consequential-click keywords. HEURISTIC TEXT MATCHING ONLY: classify()
+ * checks the click target's accessible name / visible label against these
+ * word-boundary patterns. This is NOT semantic understanding — an icon-only
+ * button with no accessible name (empty targetText) is NOT caught, a
+ * misleading label can evade it, and a benign label containing one of these
+ * words (e.g. "Remove filter") will over-trigger. The list is deliberately
+ * tight and financial/irreversible-focused.
+ */
+const CONSEQUENTIAL_CLICK_PATTERNS: { re: RegExp; label: string }[] = [
+  { re: /\bbuy\b/i, label: 'buy' },
+  { re: /\bpurchase\b/i, label: 'purchase' },
+  { re: /\bpay\b/i, label: 'pay' },
+  { re: /\bcheckout\b/i, label: 'checkout' },
+  { re: /\bplace\s+order\b/i, label: 'place order' },
+  { re: /\bsubscribe\b/i, label: 'subscribe' },
+  { re: /\bdelete\b/i, label: 'delete' },
+  { re: /\bremove\b/i, label: 'remove' },
+  { re: /\btransfer\b/i, label: 'transfer' },
+  { re: /\bwithdraw\b/i, label: 'withdraw' },
+  { re: /\bsend\s+money\b/i, label: 'send money' },
+];
+
+/** Which keyword (if any) the target text matches; undefined when clean. */
+export function consequentialClickKeyword(targetText: string | undefined): string | undefined {
+  if (!targetText) return undefined;
+  for (const { re, label } of CONSEQUENTIAL_CLICK_PATTERNS) {
+    if (re.test(targetText)) return label;
+  }
+  return undefined;
+}
 
 export class PolicyEngine {
   private readonly confirmMedium: boolean;
@@ -83,6 +124,14 @@ export class PolicyEngine {
     ) {
       return 'high';
     }
+    // Consequential clicks: heuristic keyword match on the target's label.
+    // Icon-only buttons (empty targetText) are NOT caught — documented limit.
+    if (
+      (action.action === 'click' || action.action === 'double_click') &&
+      consequentialClickKeyword(ctx.targetText) !== undefined
+    ) {
+      return 'high';
+    }
     if (MEDIUM_ACTIONS.has(action.action)) return 'medium';
     return 'low';
   }
@@ -91,10 +140,16 @@ export class PolicyEngine {
     const risk = this.classify(action, ctx);
 
     if (risk === 'high') {
+      const keyword =
+        (action.action === 'click' || action.action === 'double_click')
+          ? consequentialClickKeyword(ctx.targetText)
+          : undefined;
       const why =
         ctx.inputType === 'password'
           ? 'typing into a password field requires explicit user confirmation'
-          : `high-risk action "${action.action}" requires explicit user confirmation`;
+          : keyword !== undefined
+            ? `click target "${ctx.targetText}" matches consequential keyword "${keyword}" — requires explicit user confirmation`
+            : `high-risk action "${action.action}" requires explicit user confirmation`;
       return { verdict: 'confirm', risk, reason: why };
     }
     if (risk === 'medium' && this.confirmMedium) {

@@ -54,6 +54,50 @@ describe('PolicyEngine', () => {
     engine.approveUpload('/tmp/a.png');
     expect(engine.isUploadApproved('/tmp/a.png')).toBe(true);
   });
+
+  it('confirm: click on a "Delete everything" button (consequential keyword)', () => {
+    const engine = new PolicyEngine();
+    const d = engine.decide(
+      { action: 'click', ref: 'e5' },
+      { targetText: 'Delete everything' },
+    );
+    expect(d.verdict).toBe('confirm');
+    expect(d.risk).toBe('high');
+    if (d.verdict === 'confirm') expect(d.reason).toMatch(/delete/);
+  });
+
+  it('confirm: double_click on "Pay now" and "Place order"', () => {
+    const engine = new PolicyEngine();
+    for (const label of ['Pay now', 'Place order', 'Buy now', 'Subscribe']) {
+      const d = engine.decide({ action: 'double_click', ref: 'e5' }, { targetText: label });
+      expect(d.verdict).toBe('confirm');
+      expect(d.risk).toBe('high');
+    }
+  });
+
+  it('allow: click on "Learn more" (no consequential keyword)', () => {
+    const engine = new PolicyEngine();
+    const d = engine.decide({ action: 'click', ref: 'e5' }, { targetText: 'Learn more' });
+    expect(d.verdict).toBe('allow');
+    expect(d.risk).toBe('low');
+  });
+
+  it('allow: icon-only button with empty accessible name (documented limitation)', () => {
+    // Heuristic text matching cannot see icon-only buttons: no accessible
+    // name means no keyword to match. This is a known gap, not a bug.
+    const engine = new PolicyEngine();
+    for (const targetText of [undefined, '']) {
+      const d = engine.decide({ action: 'click', ref: 'e5' }, { targetText });
+      expect(d.verdict).toBe('allow');
+      expect(d.risk).toBe('low');
+    }
+  });
+
+  it('keyword matching is word-boundary based (no "display" false positive)', () => {
+    const engine = new PolicyEngine();
+    const d = engine.decide({ action: 'click', ref: 'e5' }, { targetText: 'Display options' });
+    expect(d.verdict).toBe('allow');
+  });
 });
 
 describe('ConfirmationQueue', () => {

@@ -241,6 +241,7 @@ export class AgentLoop {
           if (live) {
             ctx.inputType = live.inputType;
             ctx.targetRole = live.role;
+            ctx.targetText = live.name || undefined;
           }
         }
         const decision = await this.policyCheck(action, ctx);

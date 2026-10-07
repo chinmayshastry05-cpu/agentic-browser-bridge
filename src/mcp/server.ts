@@ -275,6 +275,9 @@ export function buildMcpServer(
           if (live) {
             ctx.inputType = live.inputType;
             ctx.targetRole = live.role;
+            // Feed the click target's accessible name into the policy engine
+            // for consequential-click keyword matching.
+            ctx.targetText = live.name || undefined;
           }
         }
         if (name === 'browser_upload') {

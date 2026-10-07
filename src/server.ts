@@ -93,6 +93,25 @@ export class BridgeServer {
           this.emit(id, 'session.closed', { sessionId: id });
           return ok(req.id, { closed: id });
         }
+        case 'session/attach': {
+          // Attach a session to the user's existing browser over CDP.
+          // The endpoint must be an explicitly provided loopback debugging port.
+          const session = this.sessions.get(params['sessionId'] as string);
+          const cdpEndpoint = params['cdpEndpoint'] as string;
+          if (typeof cdpEndpoint !== 'string' || !cdpEndpoint) {
+            return fail(req.id, -32602, 'session/attach requires "cdpEndpoint"');
+          }
+          await session.attach({ cdpEndpoint });
+          this.emit(session.id, 'session.attached', {
+            sessionId: session.id,
+            backend: session.backendName,
+          });
+          return ok(req.id, {
+            sessionId: session.id,
+            backend: session.backendName,
+            userBrowser: session.isUserBrowser,
+          });
+        }
         case 'tools/list': {
           const session = this.sessions.get(params['sessionId'] as string);
           const registry = createToolRegistry(session);

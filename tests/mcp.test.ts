@@ -14,10 +14,12 @@ import { AgentLoop } from '../src/agent-loop.js';
 import { createToolRegistry, listToolDefinitions } from '../src/tools.js';
 import { BridgeServer } from '../src/server.js';
 import type {
+  BrowserAttachOptions,
   BrowserBackend,
   DomNode,
   LLMProvider,
   PageSnapshot,
+  TabInfo,
 } from '../src/types.js';
 
 /* ------------------------------------------------------------------ */
@@ -47,21 +49,56 @@ function sampleSnapshot(): PageSnapshot {
     node({ ref: 'e4', role: 'form', name: 'greet form', tag: 'form', childrenRefs: ['e3'] }),
     node({ ref: 'e5', role: 'link', name: 'Docs', tag: 'a', attributes: { href: 'https://example.com' }, visible: false }),
   ];
-  return { url: 'https://example.test/', title: 'Demo', capturedAt: '2026-10-07T00:00:00.000Z', nodes };
+  return { snapshotId: 'snap-test', url: 'https://example.test/', title: 'Demo', capturedAt: '2026-10-07T00:00:00.000Z', nodes };
 }
 
 class MockBackend implements BrowserBackend {
+  readonly backendName = 'mock';
   navigated: string[] = [];
   clicked: string[] = [];
   typed: Array<{ selector: string; text: string; submit: boolean }> = [];
   screenshots: string[] = [];
   snapshotData: PageSnapshot = sampleSnapshot();
   started = false;
+  attached: string[] = [];
+  tabs: TabInfo[] = [
+    { id: 'tab-1', url: 'https://example.test/', title: 'Demo', active: true },
+  ];
+
+  get connected(): boolean { return this.started; }
+  get isUserBrowser(): boolean { return false; }
 
   async start(): Promise<void> { this.started = true; }
+  async attach(opts: BrowserAttachOptions): Promise<void> { this.attached.push(opts.cdpEndpoint); this.started = true; }
   async stop(): Promise<void> { this.started = false; }
   async goto(url: string): Promise<void> { this.navigated.push(url); }
-  async snapshot(): Promise<PageSnapshot> { return this.snapshotData; }
+  async goBack(): Promise<void> { /* noop */ }
+  async goForward(): Promise<void> { /* noop */ }
+  async reload(): Promise<void> { /* noop */ }
+  async listTabs(): Promise<TabInfo[]> { return this.tabs; }
+  async activeTab(): Promise<TabInfo> { return this.tabs.find((t) => t.active) ?? this.tabs[0]!; }
+  async openTab(url?: string): Promise<TabInfo> {
+    const tab: TabInfo = { id: `tab-${this.tabs.length + 1}`, url: url ?? 'about:blank', title: '', active: true };
+    for (const t of this.tabs) t.active = false;
+    this.tabs.push(tab);
+    return tab;
+  }
+  async switchTab(tabId: string): Promise<TabInfo> {
+    const tab = this.tabs.find((t) => t.id === tabId);
+    if (!tab) throw new Error(`unknown tab "${tabId}"`);
+    for (const t of this.tabs) t.active = t === tab;
+    return tab;
+  }
+  async closeTab(tabId: string): Promise<void> {
+    if (this.tabs.length <= 1) throw new Error('refusing to close the last tab of the session');
+    this.tabs = this.tabs.filter((t) => t.id !== tabId);
+    if (!this.tabs.some((t) => t.active)) this.tabs[0]!.active = true;
+  }
+  private snapshotCounter = 0;
+  async snapshot(): Promise<PageSnapshot> {
+    this.snapshotCounter += 1;
+    return { ...this.snapshotData, snapshotId: `snap-mock-${this.snapshotCounter}` };
+  }
   async click(selector: string): Promise<void> { this.clicked.push(selector); }
   async type(selector: string, text: string, submit: boolean): Promise<void> {
     this.typed.push({ selector, text, submit });
@@ -147,13 +184,21 @@ describe('mcp tools', () => {
     ({ session, backend } = makeSession());
   });
 
-  it('exposes exactly the five browser tools with JSON schemas', () => {
+  it('exposes the browser tools with JSON schemas', () => {
     const defs = listToolDefinitions(createToolRegistry(session));
     expect(defs.map((d) => d.name).sort()).toEqual([
+      'browser_back',
       'browser_click',
+      'browser_close_tab',
+      'browser_forward',
       'browser_navigate',
+      'browser_open_tab',
+      'browser_reload',
       'browser_screenshot',
       'browser_snapshot',
+      'browser_status',
+      'browser_switch_tab',
+      'browser_tabs',
       'browser_type',
     ]);
     for (const d of defs) {
@@ -382,6 +427,71 @@ describe('bridge server rpc', () => {
     const manager: SessionManager = server.sessionManager;
     manager.create(new MockBackend());
     expect(() => manager.create(new MockBackend())).toThrow(/session limit/);
+    await server.stop();
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* browser session: tabs + attach + snapshot ids (M1)                   */
+/* ------------------------------------------------------------------ */
+
+describe('session tabs and attach', () => {
+  it('delegates tab operations to the backend', async () => {
+    const { session, backend } = makeSession();
+    const tabs = await session.listTabs();
+    expect(tabs).toHaveLength(1);
+
+    const opened = await session.openTab('https://example.com/2');
+    expect(opened.id).toBe('tab-2');
+    expect((await session.listTabs())).toHaveLength(2);
+
+    const switched = await session.switchTab('tab-1');
+    expect(switched.active).toBe(true);
+
+    await session.closeTab('tab-2');
+    expect((await session.listTabs())).toHaveLength(1);
+    await expect(session.closeTab('tab-1')).rejects.toThrow(/last tab/);
+    expect(backend.tabs).toHaveLength(1);
+  });
+
+  it('attaches to an explicit CDP endpoint through the session', async () => {
+    const { session, backend } = makeSession();
+    await session.attach({ cdpEndpoint: 'http://127.0.0.1:9222' });
+    expect(backend.attached).toEqual(['http://127.0.0.1:9222']);
+  });
+
+  it('assigns a unique snapshotId per snapshot', async () => {
+    const { session } = makeSession();
+    const a = await session.snapshot();
+    const b = await session.snapshot();
+    expect(a.snapshotId).toMatch(/^snap-/);
+    expect(b.snapshotId).toMatch(/^snap-/);
+    expect(a.snapshotId).not.toBe(b.snapshotId);
+    expect(session.lastSnapshotId).toBe(b.snapshotId);
+  });
+
+  it('browser_status reports backend and connection state', async () => {
+    const { session } = makeSession();
+    const registry = createToolRegistry(session);
+    const res = await registry.get('browser_status')!.handle({});
+    expect(res.ok).toBe(true);
+    const data = res.data as Record<string, unknown>;
+    expect(data['backend']).toBe('mock');
+    expect(data['userBrowser']).toBe(false);
+    expect(data['sessionId']).toBe('test');
+  });
+
+  it('session/attach RPC validates its parameters', async () => {
+    const server = new BridgeServer({ maxSessions: 2 });
+    const manager = server.sessionManager;
+    const session = manager.create(new MockBackend());
+    const bad = await server.rpcForTest({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'session/attach',
+      params: { sessionId: session.id },
+    });
+    expect(bad.error?.code).toBe(-32602);
     await server.stop();
   });
 });

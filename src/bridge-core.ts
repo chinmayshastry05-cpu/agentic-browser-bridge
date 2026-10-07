@@ -14,339 +14,63 @@
  * The `BrowserBackend` interface (see types.ts) keeps the session layer
  * backend-agnostic: to drive a different automation stack, implement the
  * interface and pass it to BrowserSession — no other module changes.
+ *
+ * Backends live in src/browser/:
+ *   - PlaywrightBackend: launches an isolated Chromium (testing/demo).
+ *   - CdpBackend: attaches to the user's existing Chrome/Edge over CDP.
  */
-import { chromium, type Browser, type Page } from 'playwright';
 import {
+  type BrowserAttachOptions,
   type BrowserBackend,
   type BrowserStartOptions,
-  type DomNode,
   type PageSnapshot,
+  type TabInfo,
 } from './types.js';
+import { PlaywrightBackend } from './browser/playwright-backend.js';
+import { CdpBackend } from './browser/cdp-backend.js';
 
-const REF_ATTR = 'data-abb-ref';
-
-/** Roles we consider interactable for the agent. */
-const INTERACTABLE_SELECTOR = [
-  'a[href]',
-  'button',
-  'input',
-  'select',
-  'textarea',
-  '[role="button"]',
-  '[role="link"]',
-  '[role="textbox"]',
-  '[role="checkbox"]',
-  '[role="radio"]',
-  '[role="switch"]',
-  '[role="tab"]',
-  '[role="menuitem"]',
-  '[onclick]',
-].join(',');
-
-/** Structural roles we also capture so the tree has headings/landmarks. */
-const STRUCTURAL_SELECTOR = [
-  'h1',
-  'h2',
-  'h3',
-  'img[alt]',
-  'form',
-  'table',
-  'main',
-  'nav',
-  'header',
-  'footer',
-].join(',');
-
-interface RawNode {
-  ref: string;
-  role: string;
-  name: string;
-  tag: string;
-  text: string;
-  attributes: Record<string, string>;
-  selector: string;
-  parentRef: string | null;
-  boundingBox: { x: number; y: number; width: number; height: number } | null;
-  visible: boolean;
-}
-
-/**
- * Playwright-backed implementation of BrowserBackend.
- * Snapshotting is done with an in-page DOM walk (page.evaluate) that assigns
- * stable `data-abb-ref` attributes, so refs are resolvable later by selector.
- */
-export class PlaywrightBackend implements BrowserBackend {
-  private browser: Browser | null = null;
-  private page: Page | null = null;
-  private navigationTimeoutMs = 30_000;
-
-  async start(opts: BrowserStartOptions): Promise<void> {
-    if (this.browser) return;
-    this.navigationTimeoutMs = opts.navigationTimeoutMs ?? 30_000;
-    this.browser = await chromium.launch({ headless: opts.headless });
-    const context = await this.browser.newContext({
-      viewport: opts.viewport ?? { width: 1280, height: 800 },
-    });
-    this.page = await context.newPage();
-    this.page.setDefaultNavigationTimeout(this.navigationTimeoutMs);
-    this.page.setDefaultTimeout(Math.min(this.navigationTimeoutMs, 15_000));
-  }
-
-  async stop(): Promise<void> {
-    await this.browser?.close().catch(() => undefined);
-    this.browser = null;
-    this.page = null;
-  }
-
-  private requirePage(): Page {
-    if (!this.page) throw new Error('backend not started: call start() first');
-    return this.page;
-  }
-
-  async goto(url: string): Promise<void> {
-    await this.requirePage().goto(url, { waitUntil: 'domcontentloaded' });
-  }
-
-  currentUrl(): string {
-    return this.page?.url() ?? '';
-  }
-
-  async title(): Promise<string> {
-    return this.requirePage().title();
-  }
-
-  async click(selector: string): Promise<void> {
-    const page = this.requirePage();
-    await page.locator(selector).first().scrollIntoViewIfNeeded().catch(() => undefined);
-    await page.locator(selector).first().click({ timeout: 10_000 });
-  }
-
-  async type(selector: string, text: string, submit: boolean): Promise<void> {
-    const page = this.requirePage();
-    const locator = page.locator(selector).first();
-    await locator.scrollIntoViewIfNeeded().catch(() => undefined);
-    await locator.fill(text, { timeout: 10_000 });
-    if (submit) await page.keyboard.press('Enter');
-  }
-
-  async screenshot(path: string): Promise<void> {
-    await this.requirePage().screenshot({ path, fullPage: false });
-  }
-
-  async snapshot(): Promise<PageSnapshot> {
-    const page = this.requirePage();
-    const raw = await page.evaluate(
-      ({ interactableSel, structuralSel, refAttr }) => {
-        const seen = new WeakSet<Element>();
-        const nodes: Array<{
-          ref: string;
-          role: string;
-          name: string;
-          tag: string;
-          text: string;
-          attributes: Record<string, string>;
-          selector: string;
-          parentRef: string | null;
-          boundingBox: { x: number; y: number; width: number; height: number } | null;
-          visible: boolean;
-        }> = [];
-        let counter = 0;
-
-        const cssEscape = (s: string): string => {
-          if (typeof CSS !== 'undefined' && CSS.escape) return CSS.escape(s);
-          return s.replace(/[^a-zA-Z0-9_-]/g, '\\$&');
-        };
-
-        /** Build a unique CSS selector for an element. */
-        const uniqueSelector = (el: Element): string => {
-          if (el.id) return `#${cssEscape(el.id)}`;
-          const parts: string[] = [];
-          let cur: Element | null = el;
-          while (cur && cur !== document.documentElement && parts.length < 8) {
-            let part = cur.tagName.toLowerCase();
-            const parent: Element | null = cur.parentElement;
-            if (parent) {
-              const tagName = cur.tagName;
-              const self: Element = cur;
-              const siblings = Array.from(parent.children).filter(
-                (c) => c.tagName === tagName,
-              );
-              if (siblings.length > 1) {
-                part += `:nth-of-type(${siblings.indexOf(self) + 1})`;
-              }
-            }
-            parts.unshift(part);
-            cur = parent;
-          }
-          return parts.join(' > ');
-        };
-
-        const accessibleName = (el: Element): string => {
-          const aria = el.getAttribute('aria-label');
-          if (aria) return aria.trim();
-          const labelledBy = el.getAttribute('aria-labelledby');
-          if (labelledBy) {
-            const labelEl = document.getElementById(labelledBy);
-            if (labelEl?.textContent) return labelEl.textContent.trim().slice(0, 120);
-          }
-          if (el instanceof HTMLImageElement && el.alt) return el.alt.trim();
-          if (el instanceof HTMLInputElement) {
-            if (el.placeholder) return el.placeholder.trim();
-            const labels = (el as HTMLInputElement).labels;
-            if (labels && labels.length > 0 && labels[0].textContent) {
-              return labels[0].textContent.trim().slice(0, 120);
-            }
-          }
-          const text = (el.textContent ?? '').replace(/\s+/g, ' ').trim();
-          return text.slice(0, 120);
-        };
-
-        const roleOf = (el: Element): string => {
-          const explicit = el.getAttribute('role');
-          if (explicit) return explicit.toLowerCase();
-          const tag = el.tagName.toLowerCase();
-          if (tag === 'a') return 'link';
-          if (tag === 'button') return 'button';
-          if (tag === 'input') {
-            const t = (el.getAttribute('type') ?? 'text').toLowerCase();
-            if (t === 'checkbox') return 'checkbox';
-            if (t === 'radio') return 'radio';
-            if (t === 'submit' || t === 'button') return 'button';
-            return 'textbox';
-          }
-          if (tag === 'select') return 'combobox';
-          if (tag === 'textarea') return 'textbox';
-          if (/^h[1-6]$/.test(tag)) return 'heading';
-          if (tag === 'img') return 'img';
-          if (tag === 'form') return 'form';
-          if (tag === 'table') return 'table';
-          if (tag === 'main' || tag === 'nav' || tag === 'header' || tag === 'footer')
-            return 'landmark';
-          return tag;
-        };
-
-        const interestingAttrs = (el: Element): Record<string, string> => {
-          const out: Record<string, string> = {};
-          for (const a of ['type', 'href', 'placeholder', 'value', 'name', 'alt', 'title', 'target']) {
-            const v = el.getAttribute(a);
-            if (v !== null && v !== '') out[a] = v.slice(0, 200);
-          }
-          return out;
-        };
-
-        const visit = (el: Element, parentRef: string | null): void => {
-          if (seen.has(el)) return;
-          seen.add(el);
-          counter += 1;
-          const ref = `e${counter}`;
-          el.setAttribute(refAttr, ref);
-          const rect = el.getBoundingClientRect();
-          const style = window.getComputedStyle(el);
-          const visible =
-            rect.width > 0 &&
-            rect.height > 0 &&
-            style.visibility !== 'hidden' &&
-            style.display !== 'none';
-          nodes.push({
-            ref,
-            role: roleOf(el),
-            name: accessibleName(el),
-            tag: el.tagName.toLowerCase(),
-            text:
-              el.tagName.toLowerCase() === 'input' ||
-              el.tagName.toLowerCase() === 'textarea'
-                ? (el as HTMLInputElement).value.slice(0, 200)
-                : (el.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 200),
-            attributes: interestingAttrs(el),
-            selector: uniqueSelector(el),
-            parentRef,
-            boundingBox:
-              rect.width > 0
-                ? { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
-                : null,
-            visible,
-          });
-          // Recurse only into nested interactables/structural elements to keep
-          // snapshots compact.
-          const kids = el.querySelectorAll(`${interactableSel},${structuralSel}`);
-          for (const kid of Array.from(kids)) {
-            if (kid === el || seen.has(kid)) continue;
-            // Only treat as a child if no intermediate interesting ancestor exists.
-            let p: Element | null = kid.parentElement;
-            let nested = false;
-            while (p && p !== el) {
-              if (seen.has(p)) {
-                nested = true;
-                break;
-              }
-              p = p.parentElement;
-            }
-            if (!nested) visit(kid, ref);
-          }
-        };
-
-        const roots = document.querySelectorAll(`${interactableSel},${structuralSel}`);
-        for (const root of Array.from(roots)) {
-          if (seen.has(root)) continue;
-          // Skip if an ancestor is already captured (it will recurse into this).
-          let p: Element | null = root.parentElement;
-          let covered = false;
-          while (p) {
-            if (seen.has(p)) {
-              covered = true;
-              break;
-            }
-            p = p.parentElement;
-          }
-          if (!covered) visit(root, null);
-        }
-        return nodes;
-      },
-      { interactableSel: INTERACTABLE_SELECTOR, structuralSel: STRUCTURAL_SELECTOR, refAttr: REF_ATTR },
-    );
-
-    const byRef = new Map<string, RawNode>(raw.map((n) => [n.ref, n]));
-    const nodes: DomNode[] = raw.map((n) => ({
-      ...n,
-      childrenRefs: raw.filter((c) => c.parentRef === n.ref).map((c) => c.ref),
-    }));
-    // Sanity: every parentRef must exist.
-    for (const n of nodes) {
-      if (n.parentRef && !byRef.has(n.parentRef)) n.parentRef = null;
-    }
-
-    return {
-      url: this.currentUrl(),
-      title: await this.title().catch(() => ''),
-      capturedAt: new Date().toISOString(),
-      nodes,
-    };
-  }
-}
+export { PlaywrightBackend, CdpBackend };
 
 /**
  * BrowserSession — one named agent-driven browser session.
  * Owns the ref→selector resolution so tools and the agent loop only ever
  * handle short refs ("e12") while actions resolve to unique selectors.
+ *
+ * Refs are scoped to a snapshot: each snapshot() call assigns a snapshotId,
+ * and refs from older snapshots are rejected (stale refs must be re-taken).
  */
 export class BrowserSession {
   readonly id: string;
   private readonly backend: BrowserBackend;
   private selectorByRef = new Map<string, string>();
-  private lastSnapshotAt: string | null = null;
+  private lastSnapshot: PageSnapshot | null = null;
 
   constructor(id: string, backend: BrowserBackend = new PlaywrightBackend()) {
     this.id = id;
     this.backend = backend;
   }
 
+  get backendName(): string {
+    return this.backend.backendName;
+  }
+
+  get isUserBrowser(): boolean {
+    return this.backend.isUserBrowser;
+  }
+
   async start(opts: BrowserStartOptions): Promise<void> {
     await this.backend.start(opts);
+  }
+
+  /** Attach this session to the user's existing browser over CDP. */
+  async attach(opts: BrowserAttachOptions): Promise<void> {
+    await this.backend.attach(opts);
   }
 
   async close(): Promise<void> {
     await this.backend.stop();
     this.selectorByRef.clear();
+    this.lastSnapshot = null;
   }
 
   async navigate(url: string): Promise<{ url: string; title: string }> {
@@ -357,11 +81,42 @@ export class BrowserSession {
     return { url: this.backend.currentUrl(), title: await this.backend.title() };
   }
 
+  async goBack(): Promise<{ url: string }> {
+    await this.backend.goBack();
+    return { url: this.backend.currentUrl() };
+  }
+
+  async goForward(): Promise<{ url: string }> {
+    await this.backend.goForward();
+    return { url: this.backend.currentUrl() };
+  }
+
+  async reload(): Promise<{ url: string }> {
+    await this.backend.reload();
+    return { url: this.backend.currentUrl() };
+  }
+
+  async listTabs(): Promise<TabInfo[]> {
+    return this.backend.listTabs();
+  }
+
+  async openTab(url?: string): Promise<TabInfo> {
+    return this.backend.openTab(url);
+  }
+
+  async switchTab(tabId: string): Promise<TabInfo> {
+    return this.backend.switchTab(tabId);
+  }
+
+  async closeTab(tabId: string): Promise<void> {
+    await this.backend.closeTab(tabId);
+  }
+
   async snapshot(): Promise<PageSnapshot> {
     const snap = await this.backend.snapshot();
     this.selectorByRef.clear();
     for (const n of snap.nodes) this.selectorByRef.set(n.ref, n.selector);
-    this.lastSnapshotAt = snap.capturedAt;
+    this.lastSnapshot = snap;
     return snap;
   }
 
@@ -392,8 +147,12 @@ export class BrowserSession {
     return this.backend.currentUrl();
   }
 
-  get lastSnapshot(): string | null {
-    return this.lastSnapshotAt;
+  get lastSnapshotAt(): string | null {
+    return this.lastSnapshot?.capturedAt ?? null;
+  }
+
+  get lastSnapshotId(): string | null {
+    return this.lastSnapshot?.snapshotId ?? null;
   }
 }
 

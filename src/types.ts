@@ -27,10 +27,17 @@ export interface DomNode {
   boundingBox?: { x: number; y: number; width: number; height: number } | null;
   /** Whether the element is rendered and not hidden. */
   visible: boolean;
+  /**
+   * Frame context for the node. Undefined for top-frame nodes; set to a
+   * frame id for nodes captured inside an iframe / shadow scope.
+   */
+  frameId?: string;
 }
 
 /** A point-in-time capture of a page. */
 export interface PageSnapshot {
+  /** Unique id for this snapshot; refs are only valid within it. */
+  snapshotId: string;
   url: string;
   title: string;
   capturedAt: string; // ISO timestamp
@@ -90,11 +97,33 @@ export interface AgentTrace {
 }
 
 /** Backend-agnostic browser automation contract. Swap Playwright for something
- *  else by implementing this interface; the session layer never imports Playwright. */
+ *  else by implementing this interface; the session layer never imports Playwright.
+ *
+ *  Backends come in two flavours:
+ *   - launched: start() launches a fresh browser the bridge owns (testing/demo).
+ *   - attached: attach() connects to an already-running user browser over CDP.
+ *     The user explicitly starts the browser with remote debugging enabled;
+ *     the bridge never attaches silently to arbitrary processes.
+ */
 export interface BrowserBackend {
+  readonly backendName: string;
   start(opts: BrowserStartOptions): Promise<void>;
   stop(): Promise<void>;
+  /** Attach to an existing browser over CDP. Throws if unsupported. */
+  attach(opts: BrowserAttachOptions): Promise<void>;
+  /** True after start() or attach() has succeeded. */
+  readonly connected: boolean;
+  /** True when this backend drives a user-owned browser (attached), false when launched. */
+  readonly isUserBrowser: boolean;
   goto(url: string): Promise<void>;
+  goBack(): Promise<void>;
+  goForward(): Promise<void>;
+  reload(): Promise<void>;
+  listTabs(): Promise<TabInfo[]>;
+  openTab(url?: string): Promise<TabInfo>;
+  switchTab(tabId: string): Promise<TabInfo>;
+  closeTab(tabId: string): Promise<void>;
+  activeTab(): Promise<TabInfo>;
   snapshot(): Promise<PageSnapshot>;
   click(selector: string): Promise<void>;
   type(selector: string, text: string, submit: boolean): Promise<void>;
@@ -107,6 +136,22 @@ export interface BrowserStartOptions {
   headless: boolean;
   viewport?: { width: number; height: number };
   navigationTimeoutMs?: number;
+}
+
+/** Options for attaching to an existing user browser over CDP. */
+export interface BrowserAttachOptions {
+  /** CDP HTTP endpoint, e.g. "http://127.0.0.1:9222". */
+  cdpEndpoint: string;
+  navigationTimeoutMs?: number;
+}
+
+/** One browser tab/page known to the backend. */
+export interface TabInfo {
+  /** Bridge-assigned stable id for the session lifetime, e.g. "tab-1". */
+  id: string;
+  url: string;
+  title: string;
+  active: boolean;
 }
 
 /** LLM provider contract — pluggable, key always comes from the environment. */

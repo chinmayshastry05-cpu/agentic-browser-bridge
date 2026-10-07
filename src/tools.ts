@@ -133,6 +133,92 @@ export function createToolRegistry(session: BrowserSession): Map<string, ToolHan
     },
   );
 
+  register(
+    'browser_back',
+    'Navigate back in the active tab history.',
+    { type: 'object', properties: {} },
+    async () => ({ ok: true, data: await session.goBack() }),
+  );
+
+  register(
+    'browser_forward',
+    'Navigate forward in the active tab history.',
+    { type: 'object', properties: {} },
+    async () => ({ ok: true, data: await session.goForward() }),
+  );
+
+  register(
+    'browser_reload',
+    'Reload the active tab.',
+    { type: 'object', properties: {} },
+    async () => ({ ok: true, data: await session.reload() }),
+  );
+
+  register(
+    'browser_tabs',
+    'List all tabs known to this session (id, url, title, active).',
+    { type: 'object', properties: {} },
+    async () => ({ ok: true, data: { tabs: await session.listTabs() } }),
+  );
+
+  register(
+    'browser_open_tab',
+    'Open a new tab (optionally navigating to a URL) and switch to it.',
+    {
+      type: 'object',
+      properties: { url: { type: 'string', description: 'Optional URL to open' } },
+    },
+    async (args) => {
+      const url = args['url'];
+      return {
+        ok: true,
+        data: await session.openTab(typeof url === 'string' && url ? url : undefined),
+      };
+    },
+  );
+
+  register(
+    'browser_switch_tab',
+    'Switch the session to the tab with the given id (see browser_tabs).',
+    {
+      type: 'object',
+      properties: { tabId: { type: 'string', description: 'Tab id, e.g. "tab-1"' } },
+      required: ['tabId'],
+    },
+    async (args) => ({ ok: true, data: await session.switchTab(str(args, 'tabId')) }),
+  );
+
+  register(
+    'browser_close_tab',
+    'Close the tab with the given id. Refuses to close the last tab.',
+    {
+      type: 'object',
+      properties: { tabId: { type: 'string', description: 'Tab id, e.g. "tab-2"' } },
+      required: ['tabId'],
+    },
+    async (args) => {
+      await session.closeTab(str(args, 'tabId'));
+      return { ok: true, data: { closed: args['tabId'] } };
+    },
+  );
+
+  register(
+    'browser_status',
+    'Show the session connection state: backend, user-browser vs isolated, current URL, last snapshot.',
+    { type: 'object', properties: {} },
+    async () => ({
+      ok: true,
+      data: {
+        sessionId: session.id,
+        backend: session.backendName,
+        userBrowser: session.isUserBrowser,
+        url: session.url,
+        lastSnapshotId: session.lastSnapshotId,
+        tabs: await session.listTabs(),
+      },
+    }),
+  );
+
   return registry;
 }
 

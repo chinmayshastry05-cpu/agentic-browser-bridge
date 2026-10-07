@@ -19,6 +19,7 @@
 import { analyze } from '../analyzer.js';
 import { buildTree, renderTree } from '../tree.js';
 import { verifyAction } from './verifier.js';
+import { TaskStore } from '../state/task-store.js';
 import type {
   ActionVerification,
   AgentAction,
@@ -44,6 +45,14 @@ export interface AgentLoopOptions {
    * (src/security/policy.ts) is plugged in by the caller.
    */
   policyCheck?: (action: AgentAction) => Promise<'allow' | { confirm: string } | { deny: string }>;
+  /**
+   * Optional durable task store. When set, the loop creates (or resumes)
+   * a task record and persists every step, so an interrupted run can be
+   * resumed later.
+   */
+  taskStore?: TaskStore;
+  /** Resume this existing task instead of creating a new one. */
+  resumeTaskId?: string;
 }
 
 const SYSTEM_PROMPT = `You are a browser automation agent. You see a page as an element tree where each interactable element has a short ref like [e3].
@@ -120,6 +129,8 @@ export class AgentLoop {
   private readonly systemPromptExtra: string;
   private readonly onStep?: (step: StepRecord) => void;
   private readonly policyCheck: NonNullable<AgentLoopOptions['policyCheck']>;
+  private readonly taskStore?: TaskStore;
+  private readonly resumeTaskId?: string;
   private screenshotCounter = 0;
 
   constructor(
@@ -133,6 +144,8 @@ export class AgentLoop {
     this.systemPromptExtra = opts.systemPromptExtra ?? '';
     this.onStep = opts.onStep;
     this.policyCheck = opts.policyCheck ?? (async () => 'allow');
+    this.taskStore = opts.taskStore;
+    this.resumeTaskId = opts.resumeTaskId;
   }
 
   /** Exposed for tests: run one observe->plan->act->verify cycle. */
@@ -314,40 +327,73 @@ export class AgentLoop {
 
   async run(goal: string): Promise<AgentTrace> {
     const startedAt = new Date().toISOString();
-    const steps: StepRecord[] = [];
+    const store = this.taskStore;
+    let taskId = this.resumeTaskId ?? null;
+    let steps: StepRecord[] = [];
+    let startStep = 1;
+
+    if (store) {
+      if (taskId) {
+        const record = store.get(taskId);
+        if (record.status !== 'interrupted' && record.status !== 'running') {
+          throw new Error(`task ${taskId} is ${record.status} and cannot be resumed`);
+        }
+        goal = record.goal;
+        steps = record.steps.map((s) => ({ ...s }) as StepRecord);
+        startStep = steps.length + 1;
+        store.update(taskId, { status: 'running', browserSessionId: this.session.id });
+      } else {
+        taskId = store.create(goal, {
+          browserSessionId: this.session.id,
+          backendName: this.session.backendName,
+        }).taskId;
+      }
+    }
+
     let status: AgentStatus = 'failed';
     let finishReason: string | undefined;
 
-    for (let i = 1; i <= this.maxSteps; i++) {
-      const rec = await this.stepOnce(goal, i, steps);
-      steps.push(rec);
-      if (rec.action.action === 'finish') {
-        status = 'completed';
-        finishReason = rec.action.result ?? 'planner declared the goal achieved';
-        break;
+    try {
+      for (let i = startStep; i < startStep + this.maxSteps; i++) {
+        const rec = await this.stepOnce(goal, i, steps);
+        steps.push(rec);
+        if (store && taskId) {
+          store.appendStep(taskId, rec);
+          store.update(taskId, { currentUrl: this.session.url });
+        }
+        if (rec.action.action === 'finish') {
+          status = 'completed';
+          finishReason = rec.action.result ?? 'planner declared the goal achieved';
+          break;
+        }
+        if (!rec.result.ok && rec.action.action === 'noop') {
+          // Planner is broken; stop rather than burn steps.
+          status = 'failed';
+          finishReason = `planner error at step ${i}: ${rec.result.error}`;
+          break;
+        }
+        if (!rec.result.ok && rec.result.error?.startsWith('requires confirmation:')) {
+          status = 'awaiting_confirmation';
+          finishReason = rec.result.error;
+          if (store && taskId) store.update(taskId, { pendingConfirmation: rec.result.error });
+          break;
+        }
+        if (!rec.result.ok && rec.result.error?.startsWith('denied by policy:')) {
+          status = 'blocked';
+          finishReason = rec.result.error;
+          break;
+        }
       }
-      if (!rec.result.ok && rec.action.action === 'noop') {
-        // Planner is broken; stop rather than burn steps.
-        status = 'failed';
-        finishReason = `planner error at step ${i}: ${rec.result.error}`;
-        break;
-      }
-      if (!rec.result.ok && rec.result.error?.startsWith('requires confirmation:')) {
-        status = 'awaiting_confirmation';
-        finishReason = rec.result.error;
-        break;
-      }
-      if (!rec.result.ok && rec.result.error?.startsWith('denied by policy:')) {
-        status = 'blocked';
-        finishReason = rec.result.error;
-        break;
-      }
+    } catch (err) {
+      finishReason = `loop crashed: ${(err as Error).message}`;
+      if (store && taskId) store.interrupt(taskId, finishReason);
+      throw err;
     }
     if (status === 'failed' && !finishReason) {
-      finishReason =
-        steps.length >= this.maxSteps
-          ? `reached maxSteps (${this.maxSteps}) without completing`
-          : `stopped after ${steps.length} steps`;
+      finishReason = `reached maxSteps (${this.maxSteps}) without completing`;
+    }
+    if (store && taskId) {
+      store.close(taskId, status, finishReason);
     }
 
     return {

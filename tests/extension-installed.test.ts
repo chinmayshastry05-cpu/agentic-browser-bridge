@@ -181,4 +181,33 @@ describe.skipIf(!extAvailable)('installed extension smoke (genuine)', () => {
     expect(bytes.length).toBeGreaterThan(1024);
     expect(bytes.subarray(0, 8).toString('hex')).toBe('89504e470d0a1a0a');
   }, 30_000);
+
+  it('navigate to the SAME url twice: stale readiness cannot leak, ops succeed', async () => {
+    // Reproduced race: the second goto resolved via the stale readyTabs
+    // entry before the new content script loaded, and the immediate
+    // pageInfo threw "content script unreachable". The background now
+    // invalidates readiness synchronously before chrome.tabs.update.
+    await session.navigate(FIXTURE_URL);
+    await session.navigate(FIXTURE_URL);
+    const snap = await session.snapshot();
+    const greet = snap.nodes.find((n) => n.role === 'button' && n.name === 'Greet me');
+    expect(greet).toBeDefined();
+    await session.click(greet!.ref);
+    const text = await session.pageText();
+    expect(text).toContain('Hello, stranger!');
+  }, 30_000);
+
+  it('reload invalidates readiness: type round-trip succeeds after reload', async () => {
+    await session.navigate(FIXTURE_URL);
+    await session.reload();
+    const snap = await session.snapshot();
+    const name = snap.nodes.find((n) => n.role === 'textbox' && n.selector === '#name');
+    const greet = snap.nodes.find((n) => n.role === 'button' && n.name === 'Greet me');
+    expect(name).toBeDefined();
+    expect(greet).toBeDefined();
+    await session.type(name!.ref, 'Ada');
+    await session.click(greet!.ref);
+    const text = await session.pageText();
+    expect(text).toContain('Hello, Ada!');
+  }, 30_000);
 });

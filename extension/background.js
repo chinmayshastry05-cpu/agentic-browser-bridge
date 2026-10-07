@@ -24,8 +24,12 @@ let connectedAt = null;
 
 /**
  * Navigation-readiness handshake: tab ids whose content script has announced
- * itself via {type: 'abb-ready'}. A navigation (onUpdated status 'loading')
- * invalidates readiness — the content script re-announces on the new page.
+ * itself via {type: 'abb-ready'}. Readiness is invalidated SYNCHRONOUSLY in
+ * the goto/reload/goBack/goForward ops before the chrome.tabs call (the
+ * tabs.onUpdated 'loading' event below is async and would leave a race
+ * window, notably on same-URL navigations); the onUpdated listener remains
+ * as a backstop for page-initiated navigations. The content script
+ * re-announces on every new page load.
  */
 const readyTabs = new Set();
 
@@ -123,6 +127,12 @@ const tabOps = {
   },
   async goto({ url, tabId }) {
     const tab = tabId ? await tabById(tabId) : await activeTab();
+    // Invalidate SYNCHRONOUSLY before tabs.update: the tabs.onUpdated
+    // 'loading' event below is delivered asynchronously, so relying on it
+    // alone leaves a window where the stale readyTabs entry lets waitReady
+    // resolve before the new content script loads — reproduced on
+    // navigate-to-the-same-URL, where update() resolves almost immediately.
+    readyTabs.delete(tab.id);
     await chrome.tabs.update(tab.id, { url });
     // tabs.update resolves before the content script is injected — wait for
     // its readiness announcement so the next page op (pageInfo/snapshot)
@@ -132,16 +142,21 @@ const tabOps = {
   },
   async goBack({ tabId }) {
     const tab = tabId ? await tabById(tabId) : await activeTab();
+    readyTabs.delete(tab.id);
     await chrome.tabs.goBack(tab.id).catch(() => { throw new Error('no back history'); });
     return {};
   },
   async goForward({ tabId }) {
     const tab = tabId ? await tabById(tabId) : await activeTab();
+    readyTabs.delete(tab.id);
     await chrome.tabs.goForward(tab.id).catch(() => { throw new Error('no forward history'); });
     return {};
   },
   async reload({ tabId }) {
     const tab = tabId ? await tabById(tabId) : await activeTab();
+    // Same synchronous invalidation as goto: reload() resolves before the
+    // fresh content script announces, and the onUpdated event lags behind.
+    readyTabs.delete(tab.id);
     await chrome.tabs.reload(tab.id);
     await waitReady(tab.id);
     return {};

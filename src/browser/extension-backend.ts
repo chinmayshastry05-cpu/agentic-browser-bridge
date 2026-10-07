@@ -14,6 +14,16 @@
  *  - press_key dispatches synthetic KeyboardEvent (untrusted); not equivalent
  *    to Playwright's trusted input.
  *  - Screenshots use chrome.tabs.captureVisibleTab (viewport PNG).
+ *
+ * Navigation-readiness guarantee: chrome.tabs.update/reload resolve BEFORE the
+ * content script is injected, which used to race the pageInfo call inside
+ * BrowserSession.navigate() into "content script unreachable". The extension
+ * now handshakes readiness itself: the content script announces `abb-ready`
+ * on evaluation, the background tracks ready tab ids (invalidated on
+ * navigation via tabs.onUpdated), and goto/reload/openTab-with-url await
+ * waitReady() before returning — so page ops issued immediately after
+ * navigate() always find a live content script. Bridge callers that navigate
+ * by other means can await relay.waitForTabReady(extTabId) explicitly.
  */
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';

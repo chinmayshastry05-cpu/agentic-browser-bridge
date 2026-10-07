@@ -156,6 +156,16 @@ export class ExtensionRelay {
     return randomUUID();
   }
 
+  /**
+   * Wait until the extension's content script has announced readiness in the
+   * given (extension-level) tab id. Propagates the background's actionable
+   * error when the tab never becomes ready (e.g. chrome://, about:, or
+   * extension pages where content scripts cannot run).
+   */
+  async waitForTabReady(tabId: string, timeoutMs = 15_000): Promise<void> {
+    await this.sendOp('waitReady', { tabId, timeoutMs }, timeoutMs + 10_000);
+  }
+
   async close(): Promise<void> {
     for (const [, p] of this.pending) {
       clearTimeout(p.timer);

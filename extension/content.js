@@ -11,6 +11,18 @@
 (() => {
   'use strict';
 
+  // Navigation-readiness handshake: announce to the background service worker
+  // as soon as this script evaluates, so it can track which tabs have a live
+  // content script (see readyTabs in background.js). chrome.tabs.update
+  // resolves before injection, so without this the bridge races pageInfo
+  // against script readiness.
+  try {
+    chrome.runtime.sendMessage({ type: 'abb-ready', tabUrl: location.href });
+  } catch {
+    // Background not listening (e.g. service worker asleep) — ops still work;
+    // the background just won't consider this tab "ready" until re-announce.
+  }
+
   const INTERACTABLE =
     'a[href],button,input,select,textarea,[role="button"],[role="link"],' +
     '[role="textbox"],[role="checkbox"],[role="radio"],[role="switch"],' +
@@ -146,6 +158,9 @@
   }
 
   const ops = {
+    ping() {
+      return { ok: true, url: location.href };
+    },
     snapshot() {
       return { url: location.href, title: document.title, nodes: walkDom() };
     },

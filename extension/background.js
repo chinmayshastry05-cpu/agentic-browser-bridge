@@ -22,6 +22,28 @@ let reconnectDelay = RECONNECT_BASE_MS;
 let lastError = null;
 let connectedAt = null;
 
+/**
+ * Navigation-readiness handshake: tab ids whose content script has announced
+ * itself via {type: 'abb-ready'}. A navigation (onUpdated status 'loading')
+ * invalidates readiness — the content script re-announces on the new page.
+ */
+const readyTabs = new Set();
+
+async function waitReady(tabId, timeoutMs = 15000) {
+  const id = Number(tabId);
+  const timeout = Math.min(Math.max(Number(timeoutMs) || 15000, 0), 120000);
+  const start = Date.now();
+  while (!readyTabs.has(id)) {
+    if (Date.now() - start >= timeout) {
+      throw new Error(
+        `content script not ready in tab ${id} after ${timeout}ms — the tab may be a chrome://, about:, or extension page where content scripts cannot run`,
+      );
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return { ready: true, tabId: id };
+}
+
 const PAGE_OPS = new Set([
   'snapshot', 'click', 'dblclick', 'type', 'clear', 'pressKey', 'hover', 'focus',
   'scrollIntoView', 'scrollBy', 'selectOption', 'setChecked', 'waitForSelector',
@@ -77,12 +99,14 @@ async function pageOp(tabId, op, params) {
 
 const tabOps = {
   async ping() { return { version: chrome.runtime.getManifest().version }; },
+  async waitReady({ tabId, timeoutMs }) { return waitReady(tabId, timeoutMs); },
   async listTabs() {
     return (await chrome.tabs.query({})).filter((t) => t.id !== undefined).map(tabInfo);
   },
   async activeTab() { return tabInfo(await activeTab()); },
   async openTab({ url }) {
     const tab = await chrome.tabs.create({ url: url || 'about:blank', active: true });
+    if (url) await waitReady(tab.id);
     return tabInfo(tab);
   },
   async switchTab({ tabId }) {
@@ -100,7 +124,11 @@ const tabOps = {
   async goto({ url, tabId }) {
     const tab = tabId ? await tabById(tabId) : await activeTab();
     await chrome.tabs.update(tab.id, { url });
-    return { navigated: url };
+    // tabs.update resolves before the content script is injected — wait for
+    // its readiness announcement so the next page op (pageInfo/snapshot)
+    // cannot race into "content script unreachable".
+    await waitReady(tab.id);
+    return { navigated: url, tabId: tab.id };
   },
   async goBack({ tabId }) {
     const tab = tabId ? await tabById(tabId) : await activeTab();
@@ -115,6 +143,7 @@ const tabOps = {
   async reload({ tabId }) {
     const tab = tabId ? await tabById(tabId) : await activeTab();
     await chrome.tabs.reload(tab.id);
+    await waitReady(tab.id);
     return {};
   },
   async screenshot({ tabId } = {}) {
@@ -178,9 +207,14 @@ function scheduleReconnect() {
   }, reconnectDelay);
 }
 
-// Popup + options messaging.
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+// Popup + options messaging, and the content-script readiness handshake.
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
+    if (msg.type === 'abb-ready') {
+      const tabId = sender.tab?.id;
+      if (typeof tabId === 'number') readyTabs.add(tabId);
+      return { ready: true, tabId: tabId ?? null };
+    }
     if (msg.type === 'getStatus') {
       return {
         connected: !!ws && ws.readyState === WebSocket.OPEN,
@@ -208,5 +242,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 chrome.runtime.onInstalled.addListener(() => { void getWsUrl().then((u) => { wsUrl = u; connect(); }); });
 chrome.runtime.onStartup.addListener(() => { void getWsUrl().then((u) => { wsUrl = u; connect(); }); });
+// A navigation invalidates content-script readiness; the script re-announces
+// on the new page.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status === 'loading') readyTabs.delete(tabId);
+});
+chrome.tabs.onRemoved.addListener((tabId) => { readyTabs.delete(tabId); });
 // Service workers can start without the events above in some flows; connect eagerly.
 void getWsUrl().then((u) => { wsUrl = u; connect(); });

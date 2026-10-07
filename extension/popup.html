@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Agentic Browser Bridge</title>
+<style>
+  body { font-family: system-ui, sans-serif; width: 280px; padding: 12px; font-size: 13px; color: #222; }
+  h1 { font-size: 14px; margin: 0 0 8px; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #c00; }
+  .dot.on { background: #0a0; }
+  input { flex: 1; padding: 4px 6px; font-size: 12px; }
+  button { padding: 4px 10px; cursor: pointer; }
+  .note { color: #666; font-size: 11px; margin-top: 10px; }
+  .err { color: #a00; font-size: 11px; }
+</style>
+</head>
+<body>
+<h1>Agentic Browser Bridge</h1>
+<div class="row"><span id="dot" class="dot"></span><span id="status">checking…</span></div>
+<div class="row"><input id="wsUrl" placeholder="ws://127.0.0.1:8932/extension"><button id="save">Save</button></div>
+<div id="err" class="err"></div>
+<div class="note">Companion for the local bridge. Talks only to this machine (loopback). Load unpacked via chrome://extensions → Developer mode.</div>
+<script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,33 @@
+{
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Agentic Browser Bridge"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "all_frames": false,
+      "js": [
+        "content.js"
+      ],
+      "matches": [
+        "<all_urls>"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "description": "Local companion extension for the Agentic Browser bridge. Talks only to a bridge on this machine (loopback WebSocket); never phones home.",
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "manifest_version": 3,
+  "name": "Agentic Browser Bridge",
+  "permissions": [
+    "tabs",
+    "scripting",
+    "storage"
+  ],
+  "version": "0.1.0"
+}

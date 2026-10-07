@@ -20,6 +20,8 @@ import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import { URL } from 'node:url';
 import { BrowserSession, SessionManager } from './bridge-core.js';
 import { createToolRegistry } from './tools.js';
+import { TaskStore } from './state/task-store.js';
+import { ConfirmationQueue } from './security/confirm.js';
 import type { JsonRpcRequest, JsonRpcResponse, ToolResult } from './types.js';
 
 export interface ServerOptions {
@@ -36,6 +38,8 @@ export class BridgeServer {
   private readonly listeners = new Map<string, Set<EventListener>>();
   private server: http.Server | null = null;
   private readonly opts: Required<ServerOptions>;
+  private readonly taskStore = new TaskStore();
+  private readonly confirmations = new ConfirmationQueue();
 
   constructor(opts: ServerOptions = {}) {
     this.opts = {
@@ -147,6 +151,109 @@ export class BridgeServer {
     });
   }
 
+  private html(res: ServerResponse, body: string): void {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end(body);
+  }
+
+  /** Minimal local status UI: connection, sessions, tasks, confirmations. */
+  private uiPage(): string {
+    return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Agentic Browser bridge</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;color:#222}
+h1{font-size:1.4rem}h2{font-size:1.1rem;margin-top:2rem}
+table{border-collapse:collapse;width:100%;font-size:.85rem}
+th,td{border:1px solid #ccc;padding:.4rem .6rem;text-align:left;vertical-align:top}
+th{background:#f4f4f4}.pill{display:inline-block;padding:.1rem .5rem;border-radius:1rem;font-size:.75rem}
+.running{background:#d4edda}.completed{background:#cce5ff}.failed,.blocked{background:#f8d7da}
+.awaiting_confirmation,.interrupted{background:#fff3cd}
+button{margin:.1rem;padding:.3rem .7rem;cursor:pointer}
+pre{background:#f6f6f6;padding:.5rem;overflow:auto;font-size:.75rem}
+.note{color:#666;font-size:.8rem}
+</style></head><body>
+<h1>Agentic Browser bridge <span class="note">local-only · <a href="/health">health</a></span></h1>
+<p class="note">Auto-refreshes every 5s. Typed text is redacted in stored steps; secrets never appear here.</p>
+<h2>Sessions</h2><div id="sessions"><p class="note">loading…</p></div>
+<h2>Tasks</h2><div id="tasks"><p class="note">loading…</p></div>
+<h2>Pending confirmations</h2><div id="confirmations"><p class="note">loading…</p></div>
+<script>
+async function j(u, opts){const r=await fetch(u,opts);if(!r.ok)throw new Error(r.status);return r.json();}
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+async function refresh(){
+  try{
+    const h=await j('/health');
+    document.getElementById('sessions').innerHTML=h.sessions.length
+      ? '<table><tr><th>session</th></tr>'+h.sessions.map(s=>'<tr><td>'+esc(s)+'</td></tr>').join('')+'</table>'
+      : '<p class="note">no live sessions</p>';
+    const tasks=await j('/api/tasks');
+    document.getElementById('tasks').innerHTML=tasks.length
+      ? '<table><tr><th>task</th><th>status</th><th>goal</th><th>url</th><th>updated</th></tr>'+tasks.map(t=>
+        '<tr><td>'+esc(t.taskId)+'</td><td><span class="pill '+esc(t.status)+'">'+esc(t.status)+
+        '</span></td><td>'+esc(t.goal)+'</td><td>'+esc(t.currentUrl||'')+'</td><td>'+esc(t.updatedAt)+'</td></tr>').join('')+'</table>'
+      : '<p class="note">no tasks yet</p>';
+    const cs=await j('/api/confirmations');
+    document.getElementById('confirmations').innerHTML=cs.length
+      ? '<table><tr><th>id</th><th>task</th><th>action</th><th>reason</th><th></th></tr>'+cs.map(c=>
+        '<tr><td>'+esc(c.id)+'</td><td>'+esc(c.taskId)+'</td><td><pre>'+esc(JSON.stringify(c.action))+
+        '</pre></td><td>'+esc(c.reason)+'</td><td><button onclick="decide(\\''+c.id+'\\',true)">Approve</button>'+
+        '<button onclick="decide(\\''+c.id+'\\',false)">Reject</button></td></tr>').join('')+'</table>'
+      : '<p class="note">none pending</p>';
+  }catch(e){/* keep old content on transient errors */}
+}
+async function decide(id, approved){
+  await j('/api/confirmations/'+id,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({approved})});
+  refresh();
+}
+refresh();setInterval(refresh,5000);
+</script></body></html>`;
+  }
+
+  private async handleApi(
+    req: IncomingMessage,
+    res: ServerResponse,
+    url: URL,
+  ): Promise<boolean> {
+    const path = url.pathname;
+    if (req.method === 'GET' && path === '/ui') {
+      this.html(res, this.uiPage());
+      return true;
+    }
+    if (req.method === 'GET' && path === '/api/tasks') {
+      this.json(res, 200, this.taskStore.list());
+      return true;
+    }
+    if (req.method === 'GET' && path.startsWith('/api/tasks/')) {
+      const id = decodeURIComponent(path.slice('/api/tasks/'.length));
+      try {
+        this.json(res, 200, this.taskStore.get(id));
+      } catch (err) {
+        this.json(res, 404, { error: (err as Error).message });
+      }
+      return true;
+    }
+    if (req.method === 'GET' && path === '/api/confirmations') {
+      this.json(res, 200, this.confirmations.listUnresolved());
+      return true;
+    }
+    if (req.method === 'POST' && path.startsWith('/api/confirmations/')) {
+      const id = decodeURIComponent(path.slice('/api/confirmations/'.length));
+      try {
+        const body = JSON.parse(await this.readBody(req)) as { approved?: unknown };
+        if (typeof body.approved !== 'boolean') {
+          this.json(res, 400, { error: '"approved" must be a boolean' });
+          return true;
+        }
+        const c = this.confirmations.resolve(id, body.approved);
+        this.json(res, 200, { id: c.id, approved: c.approved, taskId: c.taskId });
+      } catch (err) {
+        this.json(res, 400, { error: (err as Error).message });
+      }
+      return true;
+    }
+    return false;
+  }
+
   async listen(): Promise<{ host: string; port: number }> {
     await this.stop();
     this.server = http.createServer(async (req, res) => {
@@ -156,6 +263,7 @@ export class BridgeServer {
           this.json(res, 200, { status: 'ok', sessions: this.sessions.ids() });
           return;
         }
+        if (await this.handleApi(req, res, url)) return;
         if (req.method === 'GET' && url.pathname === '/events') {
           const sessionId = url.searchParams.get('sessionId') ?? '';
           res.writeHead(200, {

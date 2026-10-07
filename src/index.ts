@@ -17,6 +17,10 @@ import { PolicyEngine } from './security/policy.js';
 import { ConfirmationQueue } from './security/confirm.js';
 import { TaskStore } from './state/task-store.js';
 import { runDemo } from './demo-lib.js';
+import { chromium } from 'playwright';
+import { existsSync, accessSync, mkdirSync, constants as fsConstants } from 'node:fs';
+import { join } from 'node:path';
+import net from 'node:net';
 
 function argValue(args: string[], name: string): string | undefined {
   const i = args.indexOf(name);
@@ -30,6 +34,7 @@ async function cmdServe(args: string[]): Promise<void> {
   const server = new BridgeServer({ host, port, headless });
   const addr = await server.listen();
   console.log(`[agentic-browser-bridge] listening on http://${addr.host}:${addr.port}`);
+  console.log(`[agentic-browser-bridge] ui:      GET /ui`);
   console.log(`[agentic-browser-bridge] health:  GET /health`);
   console.log(`[agentic-browser-bridge] rpc:     POST /rpc  (JSON-RPC 2.0)`);
   console.log(`[agentic-browser-bridge] events:  GET /events?sessionId=... (SSE)`);
@@ -89,6 +94,134 @@ async function cmdAgent(args: string[]): Promise<void> {
   }
 }
 
+async function cmdStatus(): Promise<void> {
+  const store = new TaskStore();
+  const queue = new ConfirmationQueue();
+  const tasks = store.list();
+  const byStatus: Record<string, number> = {};
+  for (const t of tasks) byStatus[t.status] = (byStatus[t.status] ?? 0) + 1;
+  console.log(
+    JSON.stringify(
+      {
+        node: process.version,
+        dataDir:
+          process.env['ABB_DATA_DIR'] ??
+          join(process.env['HOME'] ?? process.cwd(), '.agentic-browser-bridge'),
+        tasks: { total: tasks.length, byStatus },
+        pendingConfirmations: queue.listUnresolved().length,
+        providerConfigured: Boolean(process.env['OPENAI_API_KEY']),
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+interface DoctorCheck {
+  name: string;
+  ok: boolean;
+  detail: string;
+  /** When true, a failure is a warning and does not fail doctor. */
+  warnOnly?: boolean;
+}
+
+function portFree(port: number, host = '127.0.0.1'): Promise<boolean> {
+  return new Promise((resolve) => {
+    const s = net.createServer();
+    s.once('error', () => resolve(false));
+    s.listen(port, host, () => s.close(() => resolve(true)));
+  });
+}
+
+async function cmdDoctor(): Promise<void> {
+  const checks: DoctorCheck[] = [];
+  const check = async (
+    name: string,
+    fn: () => Promise<string> | string,
+    warnOnly = false,
+  ): Promise<void> => {
+    try {
+      checks.push({ name, ok: true, detail: await fn() });
+    } catch (err) {
+      checks.push({ name, ok: false, detail: (err as Error).message, warnOnly });
+    }
+  };
+
+  await check('node version', () => {
+    const major = Number(process.version.slice(1).split('.')[0]);
+    if (major < 18) throw new Error(`node ${process.version} < 18`);
+    return process.version;
+  });
+  await check('build output', () => {
+    if (!existsSync(join(process.cwd(), 'dist', 'src', 'index.js'))) {
+      throw new Error('dist/src/index.js missing — run "npm run build"');
+    }
+    return 'dist/ present';
+  });
+  await check('playwright chromium', async () => {
+    const exe = chromium.executablePath();
+    if (!existsSync(exe)) throw new Error(`chromium not found at ${exe} — run "npx playwright install chromium"`);
+    return exe;
+  });
+  await check('chromium launches headless', async () => {
+    const browser = await chromium.launch({ headless: true });
+    await browser.close();
+    return 'launch + close ok';
+  });
+  await check('bridge port 8931 free', async () => {
+    if (!(await portFree(8931))) throw new Error('port 8931 is already in use');
+    return '127.0.0.1:8931 available';
+  });
+  await check('data dir writable', () => {
+    const dir =
+      process.env['ABB_DATA_DIR'] ??
+      join(process.env['HOME'] ?? process.cwd(), '.agentic-browser-bridge');
+    mkdirSync(dir, { recursive: true });
+    accessSync(dir, fsConstants.W_OK);
+    return dir;
+  });
+  await check(
+    'LLM provider',
+    () => {
+      if (!process.env['OPENAI_API_KEY']) {
+        throw new Error('OPENAI_API_KEY not set — only needed for live agent runs (demo/tests do not need it)');
+      }
+      return 'OPENAI_API_KEY is set (value never displayed)';
+    },
+    true,
+  );
+
+  let failed = 0;
+  for (const c of checks) {
+    const tag = c.ok ? 'PASS' : c.warnOnly ? 'WARN' : 'FAIL';
+    console.log(`${tag}  ${c.name}: ${c.detail}`);
+    if (!c.ok && !c.warnOnly) failed += 1;
+  }
+  if (failed > 0) process.exitCode = 1;
+}
+
+async function cmdTasks(args: string[]): Promise<void> {
+  const store = new TaskStore();
+  const [id] = args;
+  if (id) {
+    try {
+      console.log(JSON.stringify(store.get(id), null, 2));
+    } catch (err) {
+      console.error(`[agentic-browser-bridge] ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+  const tasks = store.list();
+  if (tasks.length === 0) {
+    console.log('no tasks yet');
+    return;
+  }
+  for (const t of tasks) {
+    console.log(`${t.taskId}  [${t.status}]  ${t.goal.slice(0, 80)}  (${t.updatedAt})`);
+  }
+}
+
 async function cmdApprove(args: string[]): Promise<void> {
   const [id] = args;
   const yes = args.includes('--yes');
@@ -129,6 +262,15 @@ async function main(): Promise<void> {
     case 'approve':
       await cmdApprove(args);
       break;
+    case 'status':
+      await cmdStatus();
+      break;
+    case 'doctor':
+      await cmdDoctor();
+      break;
+    case 'tasks':
+      await cmdTasks(args);
+      break;
     default:
       console.log('agentic-browser-bridge — original local MCP browser bridge');
       console.log('');
@@ -137,6 +279,9 @@ async function main(): Promise<void> {
       console.log('  agent --goal "..." [--max-steps N]       run the agent loop (needs OPENAI_API_KEY)');
       console.log('  agent --resume <taskId>                  resume an interrupted task');
       console.log('  approve <confirmation-id> --yes|--no     approve/reject a pending high-risk action');
+      console.log('  status                                   show bridge status (tasks, confirmations)');
+      console.log('  doctor                                   check setup (node, build, chromium, port, provider)');
+      console.log('  tasks [taskId]                           list tasks or show one task');
       process.exit(cmd ? 2 : 0);
   }
 }

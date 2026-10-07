@@ -14,10 +14,18 @@
  *
  * Security properties (non-negotiable):
  *  - The pairing code is the ONLY secret here. It comes from
- *    ABB_OAUTH_PAIRING_CODE or is generated at construction, printed
- *    EXACTLY ONCE to stderr, and never stored on disk or in the repo.
- *    Every browser approval requires it (constant-time compare), so a
- *    random internet client can never self-approve.
+ *    ABB_OAUTH_PAIRING_CODE or is generated at construction (128-bit
+ *    entropy), printed EXACTLY ONCE to stderr per issuance, and never
+ *    stored on disk or in the repo. Every browser approval requires it
+ *    (constant-time compare), so a random internet client can never
+ *    self-approve.
+ *  - Brute-force bound: 5 consecutive wrong codes lock the code out
+ *    (logged; restart the server for a fresh one).
+ *  - Generated codes expire 10 minutes after issuance and are single-use:
+ *    a successful approval retires the code and a fresh one is issued.
+ *    Operator-supplied codes (ABB_OAUTH_PAIRING_CODE) are long-lived
+ *    configured secrets: no expiry, no rotation — but the attempt bound
+ *    still applies.
  *  - Auth codes are 256-bit, 10-minute expiry, single-use, and bound to
  *    (client_id, redirect_uri, PKCE code_challenge).
  *  - redirect_uris must be https: or http: loopback only — no open
@@ -34,13 +42,30 @@ const AUTH_CODE_TTL_MS = 10 * 60 * 1000;
 const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000;
 const REFRESH_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * Pairing-code policy (single-operator approval gate).
+ * - 128-bit entropy (32 hex chars, grouped for readability).
+ * - Generated codes expire 10 minutes after issuance; operator-supplied
+ *   codes (ABB_OAUTH_PAIRING_CODE) are long-lived configured secrets.
+ * - 5 consecutive failures lock the code out — restart for a fresh one.
+ * - A generated code is single-use: a successful approval retires it and
+ *   a fresh code is issued (printed once). Operator-supplied codes are not
+ *   rotated (the operator chose them deliberately).
+ */
+export const PAIRING_CODE_TTL_MS = 10 * 60 * 1000;
+export const PAIRING_CODE_MAX_ATTEMPTS = 5;
+
 const PAIRING_CODE_ENV = 'ABB_OAUTH_PAIRING_CODE';
 
 export interface OAuthProviderOptions {
-  /** Public base URL of this server, e.g. "http://127.0.0.1:8933". */
+  /** Public base URL of this server, e.g. "https://abc.trycloudflare.com". */
   issuer: string;
   /** Operator pairing code. Falls back to ABB_OAUTH_PAIRING_CODE, else generated. */
   pairingCode?: string;
+  /** Override the pairing-code TTL (tests). Defaults to PAIRING_CODE_TTL_MS. */
+  pairingCodeTtlMs?: number;
+  /** Override the failed-attempt bound (tests). Defaults to PAIRING_CODE_MAX_ATTEMPTS. */
+  pairingCodeMaxAttempts?: number;
 }
 
 export interface RegisteredClient {
@@ -107,6 +132,21 @@ function safeEqual(a: string, b: string): boolean {
   return timingSafeEqual(ab, bb);
 }
 
+/**
+ * Generate a 128-bit pairing code, grouped for operator readability:
+ * "a1b2-c3d4-...-e5f6" (32 hex chars). Exported so tests can assert the
+ * entropy/format without ever touching a live code.
+ */
+export function generatePairingCode(): string {
+  const hex = randomBytes(16).toString('hex'); // 128 bits
+  return hex.replace(/(.{4})(?=.)/g, '$1-');
+}
+
+/** Normalize operator input for comparison: ignore dashes/spaces and case. */
+function normalizePairingCode(s: string): string {
+  return s.replace(/[^0-9a-zA-Z]/g, '').toLowerCase();
+}
+
 /** PKCE S256: base64url(sha256(verifier)). */
 export function pkceS256Challenge(verifier: string): string {
   return createHash('sha256').update(verifier, 'utf8').digest('base64url');
@@ -134,7 +174,13 @@ function escAttr(s: string): string {
 
 export class OAuthProvider {
   readonly issuer: string;
-  private readonly pairingCode: string;
+  private pairingCode: string;
+  private readonly pairingCodeFromEnv: boolean;
+  private readonly pairingCodeTtlMs: number;
+  private readonly pairingCodeMaxAttempts: number;
+  private pairingCodeIssuedAt: number;
+  private pairingCodeAttempts = 0;
+  private pairingCodeValid = true;
   private readonly clients = new Map<string, RegisteredClient>();
   private readonly codes = new Map<string, AuthCodeRecord>();
   private readonly accessTokens = new Map<string, TokenRecord>();
@@ -142,13 +188,57 @@ export class OAuthProvider {
 
   constructor(opts: OAuthProviderOptions) {
     this.issuer = opts.issuer;
-    this.pairingCode =
-      opts.pairingCode ??
-      process.env[PAIRING_CODE_ENV] ??
-      randomBytes(3).toString('hex'); // 6 hex chars, e.g. "a3f9c2"
-    // Printed exactly once; never logged again, never stored, never committed.
+    const envCode = opts.pairingCode ?? process.env[PAIRING_CODE_ENV];
+    this.pairingCodeFromEnv = envCode !== undefined && envCode !== '';
+    this.pairingCode = this.pairingCodeFromEnv ? envCode! : generatePairingCode();
+    this.pairingCodeTtlMs = opts.pairingCodeTtlMs ?? PAIRING_CODE_TTL_MS;
+    this.pairingCodeMaxAttempts = opts.pairingCodeMaxAttempts ?? PAIRING_CODE_MAX_ATTEMPTS;
+    this.pairingCodeIssuedAt = Date.now();
+    // Printed exactly once per issuance; never logged again, never stored, never committed.
     process.stderr.write(
       `[agentic-browser-bridge] MCP OAuth pairing code (shown once, not stored): ${this.pairingCode}\n`,
+    );
+  }
+
+  /**
+   * Validate an operator pairing-code attempt.
+   * - Wrong codes increment a consecutive-failure counter; at the bound the
+   *   code is locked out (restart the server for a fresh one) and the
+   *   lockout is logged.
+   * - Generated codes expire pairingCodeTtlMs after issuance.
+   * - A successful attempt with a generated code retires it (single-use)
+   *   and issues a fresh one, printed once.
+   */
+  checkPairingCode(input: string): { ok: true } | { ok: false; reason: 'locked' | 'expired' | 'invalid' } {
+    if (!this.pairingCodeValid) return { ok: false, reason: 'locked' };
+    if (!this.pairingCodeFromEnv && Date.now() - this.pairingCodeIssuedAt > this.pairingCodeTtlMs) {
+      return { ok: false, reason: 'expired' };
+    }
+    if (safeEqual(normalizePairingCode(input), normalizePairingCode(this.pairingCode))) {
+      this.pairingCodeAttempts = 0;
+      if (!this.pairingCodeFromEnv) this.rotatePairingCode();
+      return { ok: true };
+    }
+    this.pairingCodeAttempts += 1;
+    if (this.pairingCodeAttempts >= this.pairingCodeMaxAttempts) {
+      this.pairingCodeValid = false;
+      process.stderr.write(
+        `[agentic-browser-bridge] OAuth pairing code LOCKED OUT after ${this.pairingCodeMaxAttempts} failed attempts — restart the server for a fresh code.\n`,
+      );
+      return { ok: false, reason: 'locked' };
+    }
+    return { ok: false, reason: 'invalid' };
+  }
+
+  /** Retire the current generated code and issue a fresh one (single-use). */
+  private rotatePairingCode(): void {
+    this.pairingCode = generatePairingCode();
+    this.pairingCodeIssuedAt = Date.now();
+    this.pairingCodeAttempts = 0;
+    this.pairingCodeValid = true;
+    process.stderr.write(
+      '[agentic-browser-bridge] pairing code used — fresh code issued (shown once, not stored): ' +
+        `${this.pairingCode}\n`,
     );
   }
 
@@ -260,9 +350,18 @@ control of your browser session — approve only if you initiated this.</p>
     if (!client || !client.redirect_uris.includes(redirectUri) || !codeChallenge) {
       return { status: 400, body: 'invalid authorization request' };
     }
-    // Constant-time pairing-code check — a wrong code never reveals anything.
-    if (!safeEqual(form['pairing_code'] ?? '', this.pairingCode)) {
-      return { status: 403, body: 'invalid pairing code' };
+    // Pairing-code gate: constant-time check with brute-force bound,
+    // expiry, and single-use rotation (see checkPairingCode). A wrong code
+    // never reveals anything about the real one.
+    const check = this.checkPairingCode(form['pairing_code'] ?? '');
+    if (!check.ok) {
+      const body =
+        check.reason === 'locked'
+          ? 'pairing code locked out after too many failed attempts — restart the server for a fresh code'
+          : check.reason === 'expired'
+            ? 'pairing code expired — restart the server for a fresh code'
+            : 'invalid pairing code';
+      return { status: 403, body };
     }
     const redirect = new URL(redirectUri);
     if (form['approved'] !== 'yes') {

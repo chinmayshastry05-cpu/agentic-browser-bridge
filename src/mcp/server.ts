@@ -18,24 +18,26 @@
  *    MCP is the operator allowlist: ABB_UPLOAD_ALLOWLIST env (comma-separated
  *    absolute paths), read at server startup. The block message says exactly
  *    this — there is no UI/CLI upload approval to promise.
- *  - The HTTP transport binds 127.0.0.1 by default. Auth is REQUIRED on
- *    /mcp when bound to a non-loopback address or when --public is passed,
- *    via EITHER the static operator bearer token (ABB_MCP_TOKEN env,
- *    explicit --token, or a generated token printed ONCE to stderr) OR a
- *    token issued by the built-in OAuth 2.0 authorization server
- *    (src/mcp/oauth.ts: authorization code + PKCE S256, operator-gated by
- *    a pairing code). This exists because ChatGPT's custom-MCP setup offers
- *    only OAuth — no bearer/API-key field — so OAuth is the only path for
- *    ChatGPT. Unauthenticated browser control is never allowed: clients
- *    that select "no authentication" still get 401.
+ *  - /mcp ALWAYS requires a credential — no exceptions, including loopback
+ *    without --public. A valid OAuth 2.0 access token (built-in authorization
+ *    server: authorization code + PKCE S256, operator-gated by a 128-bit
+ *    pairing code) OR the static operator bearer token (ABB_MCP_TOKEN env or
+ *    explicit --token). Unauthenticated browser control is never allowed:
+ *    clients that select "no authentication" in ChatGPT still get 401 with
+ *    a WWW-Authenticate challenge pointing at the protected-resource
+ *    metadata (RFC 9728), per the MCP spec. This exists because ChatGPT's
+ *    custom-MCP setup offers only OAuth — no bearer/API-key field — so OAuth
+ *    is the only path for ChatGPT.
+ *  - The stdio transport needs no auth (local OS pipe, no network).
  *  - Nothing here phones home; no secrets are written to the repo.
  */
-import { randomBytes, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import type { BrowserSession } from '../bridge-core.js';
 import { createToolRegistry } from '../tools.js';
 import { PolicyEngine, type PolicyContext } from '../security/policy.js';
@@ -325,10 +327,32 @@ export interface McpServeOptions {
   host?: string;
   /** HTTP only. Default 8933. */
   port?: number;
-  /** HTTP only: require bearer auth even on loopback. */
+  /**
+   * HTTP only. Accepted for backward compatibility: /mcp ALWAYS requires
+   * auth now, so --public no longer changes the auth behavior — it is an
+   * explicit operator acknowledgement that the endpoint may be exposed,
+   * and it is logged at startup.
+   */
   public?: boolean;
-  /** Explicit bearer token; else ABB_MCP_TOKEN; else generated once. */
+  /**
+   * Explicit static bearer token; else ABB_MCP_TOKEN. The built-in OAuth
+   * server is always active too, so a static token is optional.
+   */
   token?: string;
+  /**
+   * HTTP only. Public base URL for OAuth discovery, e.g.
+   * "https://abc123.trycloudflare.com". REQUIRED for the ChatGPT/tunnel
+   * path (ChatGPT fetches the discovery document remotely, so loopback
+   * auth URLs would be unreachable). Flag --issuer wins; else
+   * ABB_PUBLIC_URL env. Must be https with a publicly-reachable hostname
+   * (http allowed only for loopback/.localhost, for local testing).
+   * When unset, discovery uses the local bind address (local use only).
+   */
+  issuer?: string;
+  /** Override the OAuth pairing-code TTL (tests). Default 10 minutes. */
+  pairingCodeTtlMs?: number;
+  /** Override the OAuth pairing-code attempt bound (tests). Default 5. */
+  pairingCodeMaxAttempts?: number;
 }
 
 export interface McpServeHandle {
@@ -339,9 +363,112 @@ export interface McpServeHandle {
   url?: string;
 }
 
-function isLoopback(host: string): boolean {
-  const h = host.toLowerCase();
-  return h === '127.0.0.1' || h === 'localhost' || h === '::1';
+/** Normalize a hostname for comparison: loopback spellings collapse to one. */
+function normHostForCompare(host: string): string {
+  const h = host.toLowerCase().replace(/^\[|\]$/g, '');
+  if (h === '127.0.0.1' || h === 'localhost' || h === '::1' || h.endsWith('.localhost')) {
+    return 'loopback';
+  }
+  return h;
+}
+
+/** True for RFC 1918 / link-local / CGNAT IPv4 literals and IPv6 ULA/link-local. */
+function isPrivateIpLiteral(host: string): boolean {
+  const h = host.toLowerCase().replace(/^\[|\]$/g, '');
+  const v4 = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    const a = Number(v4[1]);
+    const b = Number(v4[2]);
+    if (a === 10) return true; // 10/8
+    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16/12
+    if (a === 192 && b === 168) return true; // 192.168/16
+    if (a === 169 && b === 254) return true; // 169.254/16 link-local
+    if (a === 100 && b >= 64 && b <= 127) return true; // 100.64/10 CGNAT
+    return false;
+  }
+  if (h.includes(':')) {
+    const first = h.split(':')[0] ?? '';
+    if (/^f[cdef]/i.test(first)) return true; // fc00::/7 ULA
+    if (/^fe[89ab]/i.test(first)) return true; // fe80::/10 link-local
+  }
+  return false;
+}
+
+/**
+ * Validate an operator-configured public issuer (--issuer / ABB_PUBLIC_URL).
+ * Fail-fast: a bad issuer would hand ChatGPT unreachable auth URLs.
+ * NEVER derive this from Host / X-Forwarded-* headers (forgery risk).
+ */
+export function validatePublicIssuer(raw: string): string {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error(
+      `invalid --issuer / ABB_PUBLIC_URL (not a URL): ${raw}`,
+    );
+  }
+  if (url.username || url.password) {
+    throw new Error('invalid --issuer / ABB_PUBLIC_URL: userinfo is not allowed');
+  }
+  const host = url.hostname.toLowerCase();
+  const loopbackish =
+    host === 'localhost' ||
+    host === '127.0.0.1' ||
+    host === '::1' ||
+    host === '[::1]' ||
+    /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host) ||
+    host.endsWith('.localhost');
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopbackish)) {
+    throw new Error(
+      `invalid --issuer / ABB_PUBLIC_URL: scheme must be https (http is allowed only for loopback/.localhost, for local testing): ${raw}`,
+    );
+  }
+  if (host === '0.0.0.0' || host === '::' || host === '[::]') {
+    throw new Error(
+      `invalid --issuer / ABB_PUBLIC_URL: ${host} is not an address clients can reach: ${raw}`,
+    );
+  }
+  // An explicitly configured loopback/.localhost issuer is the local-testing
+  // case (allowed above). Any other private-network literal can never be
+  // reached from the internet, so fail fast instead of publishing
+  // unreachable discovery URLs.
+  if (isPrivateIpLiteral(host)) {
+    throw new Error(
+      `invalid --issuer / ABB_PUBLIC_URL: "${url.hostname}" is not reachable from the internet — ` +
+        `pass your public https tunnel URL (e.g. https://<name>.trycloudflare.com) instead: ${raw}`,
+    );
+  }
+  return url.toString().replace(/\/+$/, '');
+}
+
+/**
+ * Warn once when forwarded headers disagree with the configured issuer.
+ * The issuer is NEVER derived from these headers — this is only a
+ * misconfiguration hint for the operator.
+ */
+function warnOnForwardMismatch(req: IncomingMessage, issuer: string): void {
+  try {
+    const iss = new URL(issuer);
+    const reqHost = (req.headers.host ?? '').split(':')[0] ?? '';
+    const fwdHostRaw = req.headers['x-forwarded-host'];
+    const fwdHost = (Array.isArray(fwdHostRaw) ? fwdHostRaw[0] : fwdHostRaw ?? '').split(':')[0] ?? '';
+    const fwdProtoRaw = req.headers['x-forwarded-proto'];
+    const fwdProto = Array.isArray(fwdProtoRaw) ? fwdProtoRaw[0] : fwdProtoRaw;
+    const mismatch =
+      (reqHost && normHostForCompare(reqHost) !== normHostForCompare(iss.hostname)) ||
+      (fwdHost && normHostForCompare(fwdHost) !== normHostForCompare(iss.hostname)) ||
+      (fwdProto && fwdProto.toLowerCase() !== iss.protocol.replace(':', ''));
+    if (mismatch) {
+      process.stderr.write(
+        `[agentic-browser-bridge] warning: request Host/forwarded headers disagree with the configured issuer ${issuer} — ` +
+          `remote clients fetch discovery from the issuer, so a mismatch means unreachable auth URLs. ` +
+          `The issuer is never taken from headers; fix --issuer / ABB_PUBLIC_URL.\n`,
+      );
+    }
+  } catch {
+    // Warning logic must never break requests.
+  }
 }
 
 function readBody(req: IncomingMessage): Promise<string> {
@@ -386,47 +513,86 @@ async function readTokenParams(req: IncomingMessage): Promise<Record<string, str
   return Object.fromEntries(new URLSearchParams(raw));
 }
 
+/** RFC 9728 protected-resource metadata for the MCP endpoint. */
+function protectedResourceDocument(issuer: string): Record<string, unknown> {
+  return {
+    resource: `${issuer}/mcp`,
+    authorization_servers: [issuer],
+    bearer_methods_supported: ['header'],
+    resource_documentation:
+      'https://github.com/chinmayshastry05-cpu/agentic-browser-bridge',
+  };
+}
+
+/** 401 for /mcp: fail closed, with the MCP-spec WWW-Authenticate challenge. */
+function unauthorizedMcp(res: ServerResponse, issuer: string): void {
+  res.writeHead(401, {
+    'content-type': 'text/plain',
+    'WWW-Authenticate': `Bearer resource_metadata="${issuer}/.well-known/oauth-protected-resource", error="invalid_token", error_description="OAuth access token or operator bearer token required"`,
+  });
+  res.end(MCP_UNAUTHORIZED_MESSAGE);
+}
+
 /**
- * Start the MCP server on the requested transport. For HTTP, auth is
- * REQUIRED on /mcp when bound to a non-loopback address or when --public
- * is passed: either the static bearer token (ABB_MCP_TOKEN / explicit
- * --token, else a generated token printed exactly once to stderr) or an
- * OAuth 2.0 access token issued by the built-in authorization server
- * (pairing code printed exactly once at startup). Unauthenticated browser
- * control is never allowed.
+ * Start the MCP server on the requested transport.
+ *
+ * HTTP: /mcp ALWAYS requires a credential — a valid OAuth 2.0 access token
+ * from the built-in authorization server OR the static operator bearer token
+ * (ABB_MCP_TOKEN / explicit --token). There are no exceptions, including
+ * loopback without --public: the documented "loopback then tunnel" setup
+ * would otherwise expose unauthenticated browser control to the internet.
+ * The stdio transport needs no auth (local OS pipe).
+ *
+ * For remote (ChatGPT) use, pass the public base URL via --issuer /
+ * ABB_PUBLIC_URL so discovery hands out reachable auth URLs; it is
+ * validated fail-fast (https + publicly-reachable host).
+ *
+ * MCP sessions are scoped per client: each initialize creates a fresh
+ * transport + McpServer pair (sharing the same BrowserSession), routed by
+ * the Mcp-Session-Id header, so concurrent ChatGPT sessions never collide.
  */
 export async function startMcpServer(
-  server: McpServer,
+  buildServer: () => McpServer,
   opts: McpServeOptions,
 ): Promise<McpServeHandle> {
   if (opts.transport === 'stdio') {
     const transport = new StdioServerTransport();
-    await server.connect(transport);
+    await buildServer().connect(transport);
     return {
       token: null,
       close: async () => {
         await transport.close().catch(() => undefined);
-        await server.close().catch(() => undefined);
       },
     };
   }
 
   const host = opts.host ?? '127.0.0.1';
   const port = opts.port ?? DEFAULT_MCP_HTTP_PORT;
-  const needAuth = !isLoopback(host) || opts.public === true;
-  let token: string | null = opts.token ?? process.env['ABB_MCP_TOKEN'] ?? null;
-  if (needAuth && !token) {
-    token = randomBytes(32).toString('hex');
-    // Printed exactly once; never logged again, never committed.
+  const token: string | null = opts.token ?? process.env['ABB_MCP_TOKEN'] ?? null;
+  if (opts.public === true) {
+    // Backward-compat no-op for auth, kept as an explicit operator
+    // acknowledgement that the endpoint may be exposed.
     process.stderr.write(
-      `[agentic-browser-bridge] generated MCP bearer token (shown once, not stored): ${token}\n`,
+      '[agentic-browser-bridge] --public acknowledged: /mcp may be exposed; auth is still REQUIRED on every request.\n',
     );
   }
 
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(),
-  });
-  await server.connect(transport);
+  // Resolve + validate the public issuer BEFORE listen() (fail fast — a bad
+  // issuer would publish unreachable discovery URLs). The default (no
+  // --issuer) uses the local bind address and is for local use only.
+  const explicitIssuer = (opts.issuer ?? process.env['ABB_PUBLIC_URL'] ?? '').trim();
+  let issuer: string | null = explicitIssuer ? validatePublicIssuer(explicitIssuer) : null;
+
+  // Per-client MCP sessions: sessionId -> transport entry. Each session gets
+  // its own transport + McpServer pair sharing the same BrowserSession.
+  const mcpSessions = new Map<string, { transport: StreamableHTTPServerTransport; server: McpServer }>();
+  const dropSession = (entry: { transport: StreamableHTTPServerTransport }): void => {
+    const sid = entry.transport.sessionId;
+    if (sid) {
+      const cur = mcpSessions.get(sid);
+      if (cur && cur.transport === entry.transport) mcpSessions.delete(sid);
+    }
+  };
 
   // Assigned after listen(), once the real port is known. The request
   // handler below references it, but no request can arrive before listen()
@@ -441,7 +607,13 @@ export async function startMcpServer(
 
       // --- OAuth 2.0 authorization-server endpoints (before /mcp) ---
       if (method === 'GET' && pathname === '/.well-known/oauth-authorization-server') {
+        warnOnForwardMismatch(req, oauth.issuer);
         json(res, 200, oauth.discoveryDocument());
+        return;
+      }
+      if (method === 'GET' && pathname === '/.well-known/oauth-protected-resource') {
+        warnOnForwardMismatch(req, oauth.issuer);
+        json(res, 200, protectedResourceDocument(oauth.issuer));
         return;
       }
       if (method === 'POST' && pathname === '/register') {
@@ -463,6 +635,7 @@ export async function startMcpServer(
         return;
       }
       if (pathname === '/authorize') {
+        warnOnForwardMismatch(req, oauth.issuer);
         if (method === 'GET') {
           const page = oauth.buildApprovalPage({
             client_id: url.searchParams.get('client_id') ?? '',
@@ -535,27 +708,75 @@ export async function startMcpServer(
         text(res, 404, 'not found');
         return;
       }
-      if (needAuth) {
-        const auth = req.headers.authorization ?? '';
-        const staticOk = token !== null && auth === `Bearer ${token}`;
-        const bearer = auth.startsWith('Bearer ') ? auth.slice('Bearer '.length) : '';
-        const oauthOk = bearer !== '' && oauth.validateToken(bearer) !== null;
-        if (!staticOk && !oauthOk) {
-          text(res, 401, MCP_UNAUTHORIZED_MESSAGE);
-          return;
-        }
+
+      // /mcp ALWAYS requires a credential: static operator bearer token OR a
+      // valid OAuth access token. No exceptions — not even loopback.
+      const auth = req.headers.authorization ?? '';
+      const staticOk = token !== null && auth === `Bearer ${token}`;
+      const bearer = auth.startsWith('Bearer ') ? auth.slice('Bearer '.length) : '';
+      const oauthOk = bearer !== '' && oauth.validateToken(bearer) !== null;
+      if (!staticOk && !oauthOk) {
+        unauthorizedMcp(res, oauth.issuer);
+        return;
       }
-      let body: unknown;
-      if (req.method === 'POST') {
+
+      const sessionIdHeader = req.headers['mcp-session-id'];
+      const sessionId = Array.isArray(sessionIdHeader) ? sessionIdHeader[0] : sessionIdHeader;
+
+      if (method === 'POST') {
+        let body: unknown;
         try {
           body = JSON.parse(await readBody(req));
         } catch {
-          res.writeHead(400, { 'content-type': 'text/plain' });
-          res.end('invalid JSON');
+          text(res, 400, 'invalid JSON');
           return;
         }
+        if (sessionId) {
+          const entry = mcpSessions.get(sessionId);
+          if (!entry) {
+            text(res, 404, 'unknown MCP session');
+            return;
+          }
+          await entry.transport.handleRequest(req as never, res as never, body);
+          return;
+        }
+        // No session id: only an initialize request may start a session.
+        if (!isInitializeRequest(body)) {
+          text(res, 400, 'missing mcp-session-id: send an initialize request to start a session');
+          return;
+        }
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (sid: string) => {
+            mcpSessions.set(sid, entry);
+          },
+        });
+        const mcpServer = buildServer();
+        const entry = { transport, server: mcpServer };
+        transport.onclose = () => dropSession(entry);
+        await mcpServer.connect(transport);
+        await transport.handleRequest(req as never, res as never, body);
+        // Belt-and-suspenders: if onsessioninitialized did not fire, map by
+        // the transport's own session id.
+        if (transport.sessionId && !mcpSessions.has(transport.sessionId)) {
+          mcpSessions.set(transport.sessionId, entry);
+        }
+        return;
       }
-      await transport.handleRequest(req as never, res as never, body);
+      if (method === 'GET' || method === 'DELETE') {
+        if (!sessionId) {
+          text(res, 400, 'missing mcp-session-id');
+          return;
+        }
+        const entry = mcpSessions.get(sessionId);
+        if (!entry) {
+          text(res, 404, 'unknown MCP session');
+          return;
+        }
+        await entry.transport.handleRequest(req as never, res as never);
+        return;
+      }
+      text(res, 405, 'method not allowed');
     } catch (err) {
       if (!res.headersSent) {
         res.writeHead(500, { 'content-type': 'text/plain' });
@@ -571,18 +792,26 @@ export async function startMcpServer(
   const addr = httpServer.address();
   const actualPort = typeof addr === 'object' && addr ? addr.port : port;
 
-  // Construct the OAuth provider with the REAL port (ChatGPT fetches the
+  if (!issuer) issuer = `http://${host}:${actualPort}`;
+  // Construct the OAuth provider with the final issuer (ChatGPT fetches the
   // discovery document from this issuer, so it must be exact).
-  oauth = new OAuthProvider({ issuer: `http://${host}:${actualPort}` });
+  oauth = new OAuthProvider({
+    issuer,
+    pairingCodeTtlMs: opts.pairingCodeTtlMs,
+    pairingCodeMaxAttempts: opts.pairingCodeMaxAttempts,
+  });
 
   return {
-    token: needAuth ? token : null,
+    token,
     url: `http://${host}:${actualPort}/mcp`,
     close: async () => {
       await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      for (const entry of mcpSessions.values()) {
+        await entry.transport.close().catch(() => undefined);
+        await entry.server.close().catch(() => undefined);
+      }
+      mcpSessions.clear();
       oauth.revokeAll(); // wipe every OAuth store on stop
-      await transport.close().catch(() => undefined);
-      await server.close().catch(() => undefined);
     },
   };
 }

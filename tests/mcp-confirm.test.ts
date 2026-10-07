@@ -48,10 +48,16 @@ describe('MCP confirmation ticket continuation (real, not promised)', () => {
     await session.start({ headless: true });
     // navigate is high-risk here so the policy returns "confirm".
     const policy = new PolicyEngine({ highRiskActions: ['navigate'] });
-    const server = buildMcpServer(session, { policy, confirmations: queue });
-    handle = await startMcpServer(server, { transport: 'http', host: '127.0.0.1', port: 0 });
+    handle = await startMcpServer(() => buildMcpServer(session, { policy, confirmations: queue }), {
+      transport: 'http',
+      host: '127.0.0.1',
+      port: 0,
+      token: 'mcp-confirm-token-1',
+    });
     client = newClient();
-    transport = new StreamableHTTPClientTransport(new URL(handle.url!));
+    transport = new StreamableHTTPClientTransport(new URL(handle.url!), {
+      requestInit: { headers: { authorization: 'Bearer mcp-confirm-token-1' } },
+    });
     await client.connect(transport);
   });
 
@@ -109,10 +115,16 @@ describe('MCP upload gate honesty', () => {
   beforeAll(async () => {
     session = new BrowserSession('mcp-upload-test', new MockBackend());
     await session.start({ headless: true });
-    const server = buildMcpServer(session, {});
-    handle = await startMcpServer(server, { transport: 'http', host: '127.0.0.1', port: 0 });
+    handle = await startMcpServer(() => buildMcpServer(session, {}), {
+      transport: 'http',
+      host: '127.0.0.1',
+      port: 0,
+      token: 'mcp-confirm-token-2',
+    });
     client = newClient();
-    transport = new StreamableHTTPClientTransport(new URL(handle.url!));
+    transport = new StreamableHTTPClientTransport(new URL(handle.url!), {
+      requestInit: { headers: { authorization: 'Bearer mcp-confirm-token-2' } },
+    });
     await client.connect(transport);
   });
 
@@ -138,10 +150,16 @@ describe('MCP upload gate honesty', () => {
   it('ABB_UPLOAD_ALLOWLIST pre-approval lets the upload through', async () => {
     const s2 = new BrowserSession('mcp-upload-allow', new MockBackend());
     await s2.start({ headless: true });
-    const server2 = buildMcpServer(s2, { uploadAllowlist: ['/tmp/allowed.txt'] });
-    const h2 = await startMcpServer(server2, { transport: 'http', host: '127.0.0.1', port: 0 });
+    const h2 = await startMcpServer(() => buildMcpServer(s2, { uploadAllowlist: ['/tmp/allowed.txt'] }), {
+      transport: 'http',
+      host: '127.0.0.1',
+      port: 0,
+      token: 'mcp-confirm-token-3',
+    });
     const c2 = newClient();
-    const t2 = new StreamableHTTPClientTransport(new URL(h2.url!));
+    const t2 = new StreamableHTTPClientTransport(new URL(h2.url!), {
+      requestInit: { headers: { authorization: 'Bearer mcp-confirm-token-3' } },
+    });
     await c2.connect(t2);
     try {
       // Register live refs first (uploadFile resolves the ref through the session).

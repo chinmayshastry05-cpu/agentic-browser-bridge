@@ -54,9 +54,9 @@ An agent can't click what it can't see. This bridge gives it eyes and hands:
 
   MCP server: `node dist/src/index.js mcp --transport stdio|http` exposes the
   30 bridge tools over MCP (stdio for local clients, Streamable HTTP on
-  127.0.0.1:8933 for remote). HTTP requires a bearer token when not
-  loopback-bound. See docs/MCP_CHATGPT.md (ChatGPT setup and authentication
-  options).
+  127.0.0.1:8933 for remote). HTTP /mcp ALWAYS requires a credential
+  (OAuth access token or operator bearer token), even on loopback.
+  See docs/MCP_CHATGPT.md (ChatGPT setup and authentication options).
 ```
 
 Key modules: `src/browser/` (backends, snapshot walker), `src/perception/`
@@ -173,8 +173,9 @@ node dist/src/index.js agent --resume task-xxxxxxxx
   scope, documented as future work.
 - **Single-user, single-machine.** No multi-user auth on the bridge itself;
   anyone who can reach localhost can drive it — keep it on loopback. The
-  MCP HTTP transport additionally requires a bearer token whenever it is
-  not loopback-bound (see `docs/MCP_CHATGPT.md`).
+  MCP HTTP transport additionally requires a credential on every /mcp
+  request (OAuth access token or bearer token), even on loopback
+  (see `docs/MCP_CHATGPT.md`).
 - **The LLM provider is required for autonomous runs** and is the only
   network call the agent makes; everything else is local and deterministic.
 
@@ -184,7 +185,7 @@ node dist/src/index.js agent --resume task-xxxxxxxx
 src/
   browser/       backends (playwright/cdp/extension), relay, factory, snapshot walker, tab/frame logic
   perception/    grounding.ts — stale detection + semantic re-grounding; visual.ts — coordinate grounding
-  mcp/           server.ts — MCP server (stdio + Streamable HTTP, bearer auth)
+  mcp/           server.ts — MCP server (stdio + Streamable HTTP, always-auth + OAuth)
   agent/         agent-loop.ts, verifier.ts
   security/      policy.ts, confirm.ts, redact.ts, injection.ts
   state/         task-store.ts — JSON task persistence + resume

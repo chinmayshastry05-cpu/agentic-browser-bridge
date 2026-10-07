@@ -38,8 +38,8 @@ function authorizeQuery(base: string, p: Record<string, string>): string {
   return u.toString();
 }
 
-/** Negative-path approve attempt: wrong pairing code or denied approval. */
-async function approveAttempt(
+/** Negative-path approve attempt: wrong pairing code or denied approval. Exported for mcp-pairing.test.ts. */
+export async function approveAttempt(
   base: string,
   clientId: string,
   pairing: string,
@@ -78,12 +78,10 @@ describe('MCP OAuth 2.0 (ChatGPT-compatible, real protocol)', () => {
     process.env['ABB_OAUTH_PAIRING_CODE'] = PAIRING;
     session = new BrowserSession('mcp-oauth-test', new MockBackend());
     await session.start({ headless: true });
-    const server = buildMcpServer(session, {});
-    handle = await startMcpServer(server, {
+    handle = await startMcpServer(() => buildMcpServer(session, {}), {
       transport: 'http',
       host: '127.0.0.1',
       port: 0,
-      public: true, // force auth so the 401 rules apply on loopback
     });
     base = new URL(handle.url!).origin;
   }, 60_000);
@@ -375,12 +373,10 @@ describe('static bearer token path still works unchanged', () => {
   it('explicit token accepted on /mcp; missing token → 401', async () => {
     const session = new BrowserSession('mcp-oauth-static-test', new MockBackend());
     await session.start({ headless: true });
-    const server = buildMcpServer(session, {});
-    const handle = await startMcpServer(server, {
+    const handle = await startMcpServer(() => buildMcpServer(session, {}), {
       transport: 'http',
       host: '127.0.0.1',
       port: 0,
-      public: true,
       token: 'static-secret-token-1',
     });
     try {

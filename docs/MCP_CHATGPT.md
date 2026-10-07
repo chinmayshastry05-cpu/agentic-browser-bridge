@@ -22,7 +22,7 @@ local agent loop (including `describeLiveTarget` for password-field context):
 node dist/src/index.js mcp --transport stdio
 
 # Remote clients incl. ChatGPT: Streamable HTTP on 127.0.0.1:8933, OAuth on
-node dist/src/index.js mcp --transport http --port 8933
+node dist/src/index.js mcp --transport http --port 8933 --issuer https://<your-tunnel>.trycloudflare.com
 ```
 
 On HTTP startup the server prints a **one-time OAuth pairing code** to
@@ -30,29 +30,46 @@ stderr (shown once, never stored). Keep the terminal visible — you need
 this code to approve ChatGPT's OAuth flow. To set your own code instead:
 `ABB_OAUTH_PAIRING_CODE=<code>` in the environment.
 
+**Pairing-code policy:** generated codes carry 128-bit entropy, expire 10
+minutes after the server starts, and are single-use (a successful approval
+retires the code and a fresh one is printed). 5 consecutive wrong codes
+lock the code out — restart the server for a fresh one. Operator-supplied
+codes (`ABB_OAUTH_PAIRING_CODE`) are long-lived but the 5-attempt bound
+still applies.
+
 Options: `--port N` (default `8933`), `--host H` (default `127.0.0.1`),
-`--headed` (visible browser), `--backend playwright|extension`
+`--issuer URL` (also `ABB_PUBLIC_URL` env; **required** for ChatGPT —
+see below), `--headed` (visible browser), `--backend playwright|extension`
 (`ABB_BACKEND` env also works).
 
 ## Authentication
 
-- **Loopback default is safe by binding:** `--host 127.0.0.1` without
-  `--public` serves browser control on loopback only. OAuth is still
-  active (ChatGPT needs it), and the static operator bearer token is not
-  required on loopback.
+- **`/mcp` ALWAYS requires a credential — no exceptions, including
+  loopback.** Every request must carry a valid OAuth 2.0 access token or
+  the static operator bearer token. The old "loopback without `--public`
+  needs no auth" behavior is gone: the documented loopback + tunnel setup
+  would otherwise expose unauthenticated browser control to the internet.
 - **OAuth 2.0 (for ChatGPT):** Authorization Code + PKCE (S256), per the
   MCP authorization spec. Discovery at
-  `/.well-known/oauth-authorization-server`, dynamic client registration
-  at `/register`, approval at `/authorize`, tokens at `/token`. The
-  approval page requires the one-time pairing code, so a stranger who
-  guesses the tunnel URL cannot self-approve.
-- **Static bearer token (operator/local use):** `ABB_MCP_TOKEN` env,
-  explicit `--token`, or a generated token printed once to stderr.
-  Accepted on `/mcp` alongside OAuth tokens.
-- **Fail closed:** `/mcp` requires a valid OAuth access token OR the
-  operator bearer token — always. If ChatGPT is configured with "No
-  authentication", its requests get **401** with a message pointing at
-  the OAuth setup. Unauthenticated browser control is never allowed.
+  `/.well-known/oauth-authorization-server`, protected-resource metadata
+  (RFC 9728) at `/.well-known/oauth-protected-resource`, dynamic client
+  registration at `/register`, approval at `/authorize`, tokens at
+  `/token`. 401 responses carry a `WWW-Authenticate: Bearer
+  resource_metadata="..."` challenge. The approval page requires the
+  pairing code, so a stranger who guesses the tunnel URL cannot
+  self-approve.
+- **Public issuer (`--issuer` / `ABB_PUBLIC_URL`): REQUIRED for ChatGPT.**
+  ChatGPT fetches the discovery document over the internet, so the
+  authorization/token/registration URLs in it must be publicly reachable.
+  Pass your tunnel's `https://` URL. Validated fail-fast at startup:
+  must be `https` (http allowed only for loopback/`.localhost`, for local
+  testing), and private-network literals are rejected. The issuer is never
+  derived from `Host` / `X-Forwarded-*` headers.
+- **Static bearer token (operator/local use):** `ABB_MCP_TOKEN` env or
+  explicit `--token`. Accepted on `/mcp` alongside OAuth tokens.
+- **Fail closed:** if ChatGPT is configured with "No authentication", its
+  requests get **401** with a message pointing at the OAuth setup.
+  Unauthenticated browser control is never allowed.
 
 Port map: `8931` bridge HTTP · `8932` extension relay WS · `8933` MCP
 Streamable HTTP.
@@ -79,10 +96,13 @@ ChatGPT → Plugins → Add offers **"Add custom MCP server"**. Its
 authentication selector offers ONLY: **OAuth**, **No authentication**,
 **"OAuth or no authentication"** — there is no Bearer/API-key field.
 
-1. Start the bridge: `node dist/src/index.js mcp --transport http --port 8933`
-   (note the pairing code printed to the terminal).
+1. Start the bridge (note the pairing code printed to the terminal):
+   `node dist/src/index.js mcp --transport http --port 8933 --issuer https://<random>.trycloudflare.com`
+   (`--issuer` is required: without it, discovery hands ChatGPT loopback
+   auth URLs it can never reach.)
 2. Start the tunnel: `cloudflared tunnel --url http://localhost:8933`
-   (note the `https://<random>.trycloudflare.com` URL).
+   (note the `https://<random>.trycloudflare.com` URL — it must match
+   the `--issuer` from step 1).
 3. In ChatGPT: Plugins → Add → "Add custom MCP server" → paste
    `https://<random>.trycloudflare.com/mcp` → authentication: **OAuth**.
 4. ChatGPT opens the bridge's `/authorize` page: enter the pairing code

@@ -30,43 +30,52 @@ function argValue(args: string[], name: string): string | undefined {
 }
 
 /**
- * `node dist/index.js mcp --transport stdio|http [--port N] [--host H] [--public] [--headed]`
+ * `node dist/index.js mcp --transport stdio|http [--port N] [--host H] [--public] [--issuer URL] [--headed]`
  *
  * Starts a real MCP server (Model Context Protocol) exposing the bridge
  * tools. stdio is for local MCP clients; Streamable HTTP is for remote
- * clients (e.g. ChatGPT developer mode). The HTTP transport binds 127.0.0.1
- * by default and REQUIRES a bearer token when bound non-locally or with
- * --public. Tool calls go through the same PolicyEngine as the local loop.
+ * clients (e.g. ChatGPT developer mode). /mcp ALWAYS requires a credential:
+ * an OAuth 2.0 access token from the built-in authorization server (pairing
+ * code printed once at startup) or the static operator bearer token
+ * (ABB_MCP_TOKEN / --token). For ChatGPT, pass the public base URL via
+ * --issuer (or ABB_PUBLIC_URL) so discovery hands out reachable URLs.
+ * Tool calls go through the same PolicyEngine as the local loop.
  */
 async function cmdMcp(args: string[]): Promise<void> {
   const transport = argValue(args, '--transport') ?? 'stdio';
   if (transport !== 'stdio' && transport !== 'http') {
-    console.error('usage: node dist/index.js mcp --transport stdio|http [--port N] [--host H] [--public] [--headed]');
+    console.error('usage: node dist/index.js mcp --transport stdio|http [--port N] [--host H] [--public] [--issuer URL] [--headed]');
     process.exit(2);
   }
   const port = Number(argValue(args, '--port') ?? process.env['ABB_MCP_PORT'] ?? 8933);
   const host = argValue(args, '--host') ?? process.env['ABB_MCP_HOST'] ?? '127.0.0.1';
   const public_ = args.includes('--public');
+  const issuerFlag = argValue(args, '--issuer') ?? undefined;
   const backend = parseBackendName(argValue(args, '--backend') ?? process.env['ABB_BACKEND']);
 
   const session = new BrowserSession('mcp', createBackend(backend));
   await session.start({ headless: !args.includes('--headed') });
-  const server = buildMcpServer(session, { policy: new PolicyEngine() });
-  const handle = await startMcpServer(server, {
+  const policy = new PolicyEngine();
+  const handle = await startMcpServer(() => buildMcpServer(session, { policy }), {
     transport: transport as 'stdio' | 'http',
     host,
     port,
     public: public_,
+    issuer: issuerFlag,
   });
 
   if (transport === 'stdio') {
     console.error('[agentic-browser-bridge] MCP stdio transport ready (speak MCP on stdin/stdout)');
   } else {
     console.log(`[agentic-browser-bridge] MCP Streamable HTTP ready at ${handle.url}`);
+    console.log('[agentic-browser-bridge] /mcp ALWAYS requires auth: OAuth access token (pairing code printed once to stderr above) or ABB_MCP_TOKEN bearer');
     if (handle.token) {
-      console.log('[agentic-browser-bridge] bearer auth REQUIRED — the token was printed once to stderr above');
+      console.log('[agentic-browser-bridge] static bearer token is set (ABB_MCP_TOKEN / --token)');
+    }
+    if (issuerFlag ?? process.env['ABB_PUBLIC_URL']) {
+      console.log(`[agentic-browser-bridge] public issuer for OAuth discovery: ${issuerFlag ?? process.env['ABB_PUBLIC_URL']}`);
     } else {
-      console.log('[agentic-browser-bridge] loopback bind without --public: no bearer token required');
+      console.log('[agentic-browser-bridge] no --issuer set: OAuth discovery uses the local bind address (local use only; pass --issuer <https-url> for ChatGPT)');
     }
   }
 
@@ -335,7 +344,7 @@ async function main(): Promise<void> {
       console.log('');
       console.log('  serve [--port N] [--host H] [--headed] [--backend playwright|extension]');
       console.log('                                           start the bridge server');
-      console.log('  mcp --transport stdio|http [--port N] [--host H] [--public] [--headed] [--backend playwright|extension]');
+      console.log('  mcp --transport stdio|http [--port N] [--host H] [--public] [--issuer URL] [--headed] [--backend playwright|extension]');
       console.log('                                           start the MCP server (stdio or Streamable HTTP)');
       console.log('  demo                                     run the local end-to-end demo');
       console.log('  agent --goal "..." [--max-steps N] [--backend playwright|extension]');

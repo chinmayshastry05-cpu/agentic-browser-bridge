@@ -55,10 +55,17 @@ describe('MCP Streamable HTTP transport (in-process, real SDK client)', () => {
     backend = new MockBackend();
     session = new BrowserSession('mcp-http-test', backend);
     await session.start({ headless: true });
-    const server = buildMcpServer(session, { policy: new PolicyEngine() });
-    handle = await startMcpServer(server, { transport: 'http', host: '127.0.0.1', port: 0 });
+    const policy = new PolicyEngine();
+    handle = await startMcpServer(() => buildMcpServer(session, { policy }), {
+      transport: 'http',
+      host: '127.0.0.1',
+      port: 0,
+      token: 'mcp-test-token-1',
+    });
     client = newClient();
-    transport = new StreamableHTTPClientTransport(new URL(handle.url!));
+    transport = new StreamableHTTPClientTransport(new URL(handle.url!), {
+      requestInit: { headers: { authorization: 'Bearer mcp-test-token-1' } },
+    });
     await client.connect(transport);
   }, 60_000);
 
@@ -110,10 +117,16 @@ describe('MCP Streamable HTTP transport (in-process, real SDK client)', () => {
     const strict = new PolicyEngine({ confirmMedium: true });
     const s2 = new BrowserSession('mcp-strict-test', new MockBackend());
     await s2.start({ headless: true });
-    const server2 = buildMcpServer(s2, { policy: strict });
-    const h2 = await startMcpServer(server2, { transport: 'http', host: '127.0.0.1', port: 0 });
+    const h2 = await startMcpServer(() => buildMcpServer(s2, { policy: strict }), {
+      transport: 'http',
+      host: '127.0.0.1',
+      port: 0,
+      token: 'mcp-test-token-2',
+    });
     const c2 = newClient();
-    const t2 = new StreamableHTTPClientTransport(new URL(h2.url!));
+    const t2 = new StreamableHTTPClientTransport(new URL(h2.url!), {
+      requestInit: { headers: { authorization: 'Bearer mcp-test-token-2' } },
+    });
     await c2.connect(t2);
     try {
       const result = await c2.callTool({
@@ -145,24 +158,70 @@ describe('MCP Streamable HTTP transport (in-process, real SDK client)', () => {
   });
 });
 
-describe('MCP HTTP bearer auth', () => {
-  it('requires the token when --public is set; 401 without it', async () => {
-    const session = new BrowserSession('mcp-auth-test', new MockBackend());
+describe('MCP HTTP always-auth (no exceptions, incl. loopback)', () => {
+  const deniedHeaders = {
+    'content-type': 'application/json',
+    accept: 'application/json, text/event-stream',
+  };
+  const initBody = JSON.stringify({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 't', version: '0' } },
+  });
+
+  it('REGRESSION: default loopback without --public and no token -> 401, not open', async () => {
+    // This is the reported blocker: /mcp used to skip auth entirely on
+    // loopback without --public, so the documented "loopback + cloudflared"
+    // setup exposed unauthenticated browser control.
+    const session = new BrowserSession('mcp-always-auth', new MockBackend());
     await session.start({ headless: true });
-    const server = buildMcpServer(session, {});
-    const handle = await startMcpServer(server, {
+    const handle = await startMcpServer(() => buildMcpServer(session, {}), {
       transport: 'http',
       host: '127.0.0.1',
       port: 0,
-      public: true,
     });
     try {
-      expect(handle.token).toBeTruthy();
-      expect(handle.token).not.toContain('placeholder');
+      const denied = await fetch(handle.url!, {
+        method: 'POST',
+        headers: deniedHeaders,
+        body: initBody,
+      });
+      expect(denied.status).toBe(401);
+      // MCP-spec challenge: WWW-Authenticate points at the protected-resource metadata.
+      const www = denied.headers.get('www-authenticate') ?? '';
+      expect(www).toContain('Bearer');
+      expect(www).toContain('resource_metadata=');
+      expect(www).toContain('/.well-known/oauth-protected-resource');
+      // A wrong token is also rejected.
+      const wrong = await fetch(handle.url!, {
+        method: 'POST',
+        headers: { ...deniedHeaders, authorization: 'Bearer wrong-token' },
+        body: initBody,
+      });
+      expect(wrong.status).toBe(401);
+    } finally {
+      await handle.close().catch(() => undefined);
+      await session.close().catch(() => undefined);
+    }
+  }, 60_000);
+
+  it('explicit static token accepted end-to-end; --public changes nothing about auth', async () => {
+    const session = new BrowserSession('mcp-auth-test', new MockBackend());
+    await session.start({ headless: true });
+    const handle = await startMcpServer(() => buildMcpServer(session, {}), {
+      transport: 'http',
+      host: '127.0.0.1',
+      port: 0,
+      public: true, // accepted as a logged no-op acknowledgement; auth still required
+      token: 'static-secret-token-1',
+    });
+    try {
+      expect(handle.token).toBe('static-secret-token-1');
       // No token -> 401.
       const denied = await fetch(handle.url!, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+        headers: deniedHeaders,
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping' }),
       });
       expect(denied.status).toBe(401);
@@ -170,7 +229,7 @@ describe('MCP HTTP bearer auth', () => {
       // proving a bearer-authenticated client can speak MCP end to end.
       const client = newClient();
       const transport = new StreamableHTTPClientTransport(new URL(handle.url!), {
-        requestInit: { headers: { authorization: `Bearer ${handle.token}` } },
+        requestInit: { headers: { authorization: 'Bearer static-secret-token-1' } },
       });
       await client.connect(transport);
       const { tools } = await client.listTools();
@@ -182,29 +241,6 @@ describe('MCP HTTP bearer auth', () => {
       await session.close().catch(() => undefined);
     }
   }, 60_000);
-
-  it('loopback without --public needs no token', async () => {
-    const session = new BrowserSession('mcp-auth-test-2', new MockBackend());
-    await session.start({ headless: true });
-    const server = buildMcpServer(session, {});
-    const handle = await startMcpServer(server, {
-      transport: 'http',
-      host: '127.0.0.1',
-      port: 0,
-    });
-    try {
-      expect(handle.token).toBeNull();
-      const res = await fetch(handle.url!, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
-        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping' }),
-      });
-      expect(res.status).not.toBe(401);
-    } finally {
-      await handle.close().catch(() => undefined);
-      await session.close().catch(() => undefined);
-    }
-  });
 });
 
 describe('MCP stdio transport (spawned CLI, real SDK client)', () => {

@@ -214,6 +214,15 @@ export interface BrowserBackend {
    * navigation nonce carries the anti-replay guarantee.
    */
   pageLoadId?(): Promise<string | null>;
+  /**
+   * Fresh live identity of the currently loaded document: the URL the page
+   * actually reports right now plus its document load id (changes on every
+   * committed navigation, including same-URL reload). Used for the
+   * pre-action live check that catches page-initiated navigation the bridge
+   * did not drive. Optional: backends that cannot provide it cheaply omit
+   * it and the session falls back to currentUrl() + pageLoadId().
+   */
+  livePageIdentity?(): Promise<{ url: string; pageLoadId: string | null }>;
 }
 
 export interface BrowserStartOptions {

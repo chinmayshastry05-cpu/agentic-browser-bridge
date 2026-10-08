@@ -277,6 +277,15 @@ export abstract class PageBackendBase implements BrowserBackend {
     }
   }
 
+  /**
+   * Fresh live identity in one call: the live page URL plus the document
+   * load id. Backs the session's pre-action live check for page-initiated
+   * navigation/reload the bridge did not drive.
+   */
+  async livePageIdentity(): Promise<{ url: string; pageLoadId: string | null }> {
+    return { url: this.currentUrl(), pageLoadId: await this.pageLoadId() };
+  }
+
   async pageInfo(): Promise<PageInfo> {
     const page = this.requirePage();
     const description = await page

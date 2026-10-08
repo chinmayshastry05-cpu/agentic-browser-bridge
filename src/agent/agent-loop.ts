@@ -272,6 +272,21 @@ export class AgentLoop {
           this.onStep?.(rec);
           return rec;
         }
+      } else {
+        // An existing approval carried this action past the policy gate.
+        // Re-verify the page is still the one the approval was bound to:
+        // the cached identity only reflects bridge-driven navigation, so a
+        // page-initiated navigation/reload after the approval was granted
+        // must void it before anything acts. Same narrowing as the MCP
+        // server path (TOCTOU limited to the check→DOM-write gap).
+        try {
+          await this.session.assertLivePageIdentity(pageId);
+        } catch (err) {
+          result = { ok: false, error: `approval voided: ${(err as Error).message}` };
+          const rec: StepRecord = { step: stepNumber, action, result, startedAt, finishedAt: new Date().toISOString() };
+          this.onStep?.(rec);
+          return rec;
+        }
       }
     } catch (err) {
       result = { ok: false, error: `policy check failed: ${(err as Error).message}` };

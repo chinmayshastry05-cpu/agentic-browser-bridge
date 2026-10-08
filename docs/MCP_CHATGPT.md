@@ -18,17 +18,37 @@ local agent loop (including `describeLiveTarget` for password-field context):
   a monotonic navigation generation, and a per-navigation page nonce), and
   the requesting MCP session. It expires 10 minutes after issuance and is
   **single-use**: the retry it unblocks consumes it, so the same call a
-  second time needs a fresh ticket. **ANY navigation voids the approval —
-  even to the identical URL:** `browser_navigate`, `browser_reload`,
-  `browser_back`/`browser_forward`, and tab open/switch/close each bump the
-  navigation generation, mint a fresh page nonce, and clear all element
-  refs. An old ref after navigation fails with the "stale ref — take a
-  fresh snapshot" error and can never resolve against the rebuilt DOM.
-  Approving `browser_type e4 "hello"` never authorizes
+  second time needs a fresh ticket. **Every bridge-driven navigation voids
+  the approval — even to the identical URL:** `browser_navigate`,
+  `browser_reload`, `browser_back`/`browser_forward`, and tab open/switch/close
+  issued through the bridge each bump the navigation generation, mint a fresh
+  page nonce, and clear all element refs. An old ref after navigation fails
+  with the "stale ref — take a fresh snapshot" error and can never resolve
+  against the rebuilt DOM. Approving `browser_type e4 "hello"` never authorizes
   `browser_type e4 "goodbye"`, and one session's approval never authorizes
   another session. Concurrent approval checks across processes (MCP server
   + `approve` CLI share the file-backed queue) are serialized with a
   lockfile, so racing the same ticket produces exactly one winner.
+- **Page-initiated navigation (pre-action live check):** the cached page
+  identity only reflects bridge-driven navigation, so after an approval is
+  granted — and before the action executes — the bridge re-reads the
+  page's LIVE identity (the actual URL plus the document's load id, which
+  changes on every committed navigation including same-URL reloads) and
+  compares it with the identity the approval was bound to. If the page
+  navigated or reloaded itself (link click, JS redirect, form submit,
+  external reload), the approval is voided exactly like a bridge navigation
+  (refs cleared, generation bumped) and nothing acts — a fresh snapshot and
+  a new ticket are required. This check runs on the Playwright and extension
+  backends, which report a live document load id; backends without one
+  degrade to URL comparison only (same-URL reloads are not detectable
+  there). **Residual limits, stated plainly:** a navigation landing in the
+  microseconds between the live check and the DOM write is not covered, and
+  pure DOM mutation with no navigation/reload is not detectable by any
+  backend and remains uncovered. `pageIdentity()` returns the cached
+  url/nonce from the last bridge-driven navigation; the live document id is
+  re-read in `onNavigationCommitted` and in this pre-action check only.
+  Do not claim fully safe autonomy — the bridge is not generally safe on
+  arbitrary websites.
 - **What is NOT protected:** a bare "Send"/"Submit" click whose label
   matches no consequential keyword is low-risk and proceeds without
   confirmation; icon-only buttons with no accessible name are NOT caught by

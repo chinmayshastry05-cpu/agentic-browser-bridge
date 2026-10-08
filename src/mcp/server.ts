@@ -339,6 +339,18 @@ export function buildMcpServer(
                 `same URL — voids it.`,
             );
           }
+          // Pre-action live page-identity check: the cached identity only
+          // reflects bridge-driven navigation. A page that navigated or
+          // reloaded ITSELF after the approval was granted would otherwise
+          // let the approval execute against a changed page. This narrows
+          // the TOCTOU window to the check→DOM-write gap (a navigation in
+          // those microseconds is not covered; pure DOM mutation without
+          // navigation/reload is not detectable).
+          try {
+            await session.assertLivePageIdentity(identity);
+          } catch (err) {
+            return errText(`approval voided: ${(err as Error).message}`);
+          }
         }
         const result = await handler.handle(a);
         return {

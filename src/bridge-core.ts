@@ -36,6 +36,17 @@ import { CdpBackend } from './browser/cdp-backend.js';
 import { reground, signatureMatches } from './perception/grounding.js';
 import { randomUUID } from 'node:crypto';
 
+/**
+ * Extract the live document load id embedded in a page nonce
+ * (`<uuid>:<loadId>`), minted by onNavigationCommitted when the backend
+ * could report one. Null for bare nonces (initial session state, or
+ * backends without pageLoadId).
+ */
+function liveLoadIdOf(identity: PageIdentity): string | null {
+  const i = identity.pageNonce.indexOf(':');
+  return i >= 0 ? identity.pageNonce.slice(i + 1) : null;
+}
+
 export { PlaywrightBackend, CdpBackend };
 
 export interface ResolvedTarget {
@@ -113,17 +124,20 @@ export class BrowserSession {
     this.navGeneration += 1;
     this.targetByRef.clear();
     this.lastSnapshot = null;
-    let liveId: string | null = null;
-    try {
-      liveId = (await this.backend.pageLoadId?.()) ?? null;
-    } catch {
-      liveId = null;
-    }
-    this.pageNonce = liveId ? `${randomUUID()}:${liveId}` : randomUUID();
-    try {
-      this.lastNavUrl = this.backend.currentUrl();
-    } catch {
-      this.lastNavUrl = null;
+    // One fresh read: prefers the backend's livePageIdentity() (single
+    // round-trip for the extension backend), falls back to currentUrl() +
+    // pageLoadId(). The live document id is mixed into the nonce so the
+    // pre-action live check has a baseline to compare against.
+    const live = await this.readLivePageIdentity();
+    this.pageNonce = live.pageLoadId ? `${randomUUID()}:${live.pageLoadId}` : randomUUID();
+    if (live.url !== null) {
+      this.lastNavUrl = live.url;
+    } else {
+      try {
+        this.lastNavUrl = this.backend.currentUrl();
+      } catch {
+        this.lastNavUrl = null;
+      }
     }
   }
 
@@ -207,6 +221,67 @@ export class BrowserSession {
     this.lastNavUrl = this.backend.currentUrl();
     this.registerSnapshot(snap);
     return snap;
+  }
+
+  /**
+   * Pre-action live page-identity check. The cached pageIdentity() only
+   * reflects bridge-driven navigation; a page that navigates or reloads
+   * ITSELF (link click, JS redirect, form submit, external reload) changes
+   * the live document without touching the session state. This re-reads the
+   * backend's LIVE identity (actual URL + document load id) and compares it
+   * with the identity the approval was bound to.
+   *
+   * On mismatch it is treated EXACTLY like a committed navigation: refs are
+   * cleared, the snapshot is nulled, navGeneration is bumped, and a fresh
+   * nonce is minted — then it throws, so the caller must demand a fresh
+   * snapshot and a new confirmation ticket. Nothing acts on a stale page.
+   *
+   * Backends without a live pageLoadId degrade to URL comparison only
+   * (same-URL reloads are not detectable there). Pure DOM mutation without
+   * any navigation/reload is NOT detectable by any backend and remains
+   * uncovered — see docs/MCP_CHATGPT.md.
+   *
+   * Residual TOCTOU: a navigation in the microseconds between this check
+   * and the DOM write is not covered.
+   */
+  async assertLivePageIdentity(expected: PageIdentity): Promise<void> {
+    const live = await this.readLivePageIdentity();
+    const urlChanged = live.url !== null && live.url !== expected.url;
+    const knownLoadId = liveLoadIdOf(expected);
+    const loadChanged =
+      live.pageLoadId !== null && knownLoadId !== null && live.pageLoadId !== knownLoadId;
+    if (urlChanged || loadChanged) {
+      await this.onNavigationCommitted();
+      throw new Error(
+        'page changed since approval (page-initiated navigation or reload detected): ' +
+          'take a fresh browser_snapshot and request a new confirmation ticket',
+      );
+    }
+  }
+
+  /** Best-effort fresh identity: livePageIdentity() when the backend has it, else currentUrl() + pageLoadId(). */
+  private async readLivePageIdentity(): Promise<{ url: string | null; pageLoadId: string | null }> {
+    try {
+      if (this.backend.livePageIdentity) {
+        const live = await this.backend.livePageIdentity();
+        return { url: live.url ?? null, pageLoadId: live.pageLoadId ?? null };
+      }
+    } catch {
+      // Fall through to the legacy fallback.
+    }
+    let url: string | null = null;
+    try {
+      url = this.backend.currentUrl();
+    } catch {
+      // Leave null: URL comparison is skipped, load-id comparison may apply.
+    }
+    let pageLoadId: string | null = null;
+    try {
+      pageLoadId = (await this.backend.pageLoadId?.()) ?? null;
+    } catch {
+      // Leave null: backends without a live load id degrade to URL-only.
+    }
+    return { url, pageLoadId };
   }
 
   /** Snapshot scoped to one iframe; refs carry that frame's id. */

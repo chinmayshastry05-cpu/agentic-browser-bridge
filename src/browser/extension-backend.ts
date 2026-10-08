@@ -301,6 +301,22 @@ export class ExtensionBackend implements BrowserBackend {
   }
 
   /**
+   * Fresh live identity in ONE relay round-trip: the URL the content script
+   * actually reports right now plus the document load id
+   * (performance.timeOrigin — changes on every committed navigation,
+   * including same-URL reload). Backs the session's pre-action live check
+   * for page-initiated navigation/reload the bridge did not drive. Refreshes
+   * the cached URL as a side effect (currentUrl() alone is cached).
+   */
+  async livePageIdentity(): Promise<{ url: string; pageLoadId: string | null }> {
+    const info = await this.op<{ url?: string; loadId?: number }>('pageInfo');
+    const loadId =
+      typeof info?.loadId === 'number' && Number.isFinite(info.loadId) ? String(info.loadId) : null;
+    if (typeof info?.url === 'string' && info.url) this.lastUrl = info.url;
+    return { url: this.lastUrl, pageLoadId: loadId };
+  }
+
+  /**
    * Coordinate-grounding surface: viewport size and topmost element at a
    * point (see src/perception/visual.ts). Out-of-viewport points return
    * null instead of throwing.

@@ -207,6 +207,13 @@ export interface BrowserBackend {
   screenshot(path: string): Promise<void>;
   currentUrl(): string;
   title(): Promise<string>;
+  /**
+   * Live identity of the currently loaded document, for approval binding.
+   * Optional: backends that can cheaply provide it (e.g. the document's
+   * load timestamp) do; others return null and the session's own per-
+   * navigation nonce carries the anti-replay guarantee.
+   */
+  pageLoadId?(): Promise<string | null>;
 }
 
 export interface BrowserStartOptions {
@@ -283,6 +290,31 @@ export interface PageInfo {
   url: string;
   title: string;
   description: string;
+}
+
+/**
+ * PageIdentity — the exact page state an approval is bound to.
+ *
+ * Compared field-wise (never string-concatenated, so a URL containing a
+ * delimiter cannot collide). An approval is void unless EVERY field matches
+ * at check time:
+ * - url: the page URL. Any cross-URL navigation voids the approval.
+ * - snapshotId: refs are snapshot-scoped; a fresh snapshot rotates the id
+ *   and voids approvals bound to older refs.
+ * - navGeneration: monotonic counter bumped on EVERY committed navigation
+ *   (goto, reload, back/forward, tab open/switch/close) — including
+ *   same-URL navigations and reloads, where url and snapshotId may not
+ *   change. Any navigation voids prior approvals and pending tickets.
+ * - pageNonce: fresh random value per committed navigation, mixed with a
+ *   backend-provided live page identity (document load timestamp) where
+ *   available. Guarantees the identity is never replayable — even across
+ *   process restarts or if url/snapshotId/generation somehow coincide.
+ */
+export interface PageIdentity {
+  url: string;
+  snapshotId: string | null;
+  navGeneration: number;
+  pageNonce: string;
 }
 
 /** A completed download tracked by the backend. */

@@ -233,11 +233,11 @@ export class AgentLoop {
     try {
       // An operator-approved action is not asked about twice (resume flow).
       // Approvals are exact: same session-task scope, same full args, same
-      // page state, unexpired, single-use.
+      // page identity (any navigation voids them), unexpired, single-use.
       const scopeKey = `task:${this.currentTaskId ?? 'adhoc'}`;
-      const pageFp = `${this.session.url}::${this.session.lastSnapshotId ?? 'none'}`;
+      const pageId = this.session.pageIdentity();
       const preApproved =
-        this.confirmations?.isApproved({ scopeKey, pageFingerprint: pageFp }, action) ?? false;
+        this.confirmations?.isApproved({ scopeKey, page: pageId }, action) ?? false;
       if (!preApproved) {
         const ctx: PolicyContext = { url: this.session.url };
         if (action.ref) {
@@ -263,7 +263,7 @@ export class AgentLoop {
               action,
               decision.reason,
               decision.risk,
-              `${this.session.url}::${this.session.lastSnapshotId ?? 'none'}`,
+              this.session.pageIdentity(),
             );
             confirmationNote = ` (confirmation id: ${c.id})`;
           }

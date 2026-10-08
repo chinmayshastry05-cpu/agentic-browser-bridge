@@ -53,7 +53,7 @@ describe('bridge server UI and API', () => {
       { action: 'type', ref: 'e5', text: 'x' },
       'typing into a password field requires explicit user confirmation',
       'high',
-      'https://example.test/::none',
+      { url: 'https://example.test/', snapshotId: null, navGeneration: 0, pageNonce: 'n' },
     );
 
     const listed = (await (await fetch(`${base}/api/confirmations`)).json()) as Array<{ id: string }>;

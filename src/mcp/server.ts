@@ -41,8 +41,8 @@ import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import type { BrowserSession } from '../bridge-core.js';
 import { createToolRegistry } from '../tools.js';
 import { PolicyEngine, type PolicyContext } from '../security/policy.js';
-import { ConfirmationQueue, sameAction, type ApprovalScope, type PendingConfirmation } from '../security/confirm.js';
-import type { AgentAction } from '../types.js';
+import { ConfirmationQueue, pageIdentityEquals, sameAction, type ApprovalScope, type PendingConfirmation } from '../security/confirm.js';
+import type { AgentAction, PageIdentity } from '../types.js';
 import { OAuthProvider, OAuthError } from './oauth.js';
 
 /** Default port for the MCP Streamable-HTTP transport (bridge HTTP: 8931, extension relay: 8932). */
@@ -183,13 +183,12 @@ function resolveUploadAllowlist(explicit?: string[]): string[] {
 }
 
 /**
- * Build the page/target fingerprint binding an approval to the exact page
- * state: "<url>::<snapshotId>". Navigation changes the URL; a fresh
- * snapshot rotates the id (refs are snapshot-scoped) — either voids the
- * approval, so approvals can never survive navigation or ref reuse.
+ * The exact page identity an approval binds to. Comes from the session:
+ * any navigation (including same-URL goto/reload) bumps the generation and
+ * mints a fresh nonce, voiding prior approvals and pending tickets.
  */
-function pageFingerprint(session: BrowserSession): string {
-  return `${session.url}::${session.lastSnapshotId ?? 'none'}`;
+function pageIdentity(session: BrowserSession): PageIdentity {
+  return session.pageIdentity();
 }
 
 /**
@@ -278,10 +277,11 @@ export function buildMcpServer(
         // from the transport; 'stdio' for the local pipe). An approval
         // granted in one session never authorizes another.
         const scopeKey = `mcp:${extra?.sessionId ?? 'stdio'}`;
-        // Page/target fingerprint at check time. Must equal the fingerprint
-        // captured when the ticket was requested, or the approval is void.
-        const fingerprint = pageFingerprint(session);
-        const scope: ApprovalScope = { scopeKey, pageFingerprint: fingerprint };
+        // Page identity at check time. Must equal the identity captured
+        // when the ticket was requested, or the approval is void. Any
+        // navigation (even same-URL) changes it.
+        const identity = pageIdentity(session);
+        const scope: ApprovalScope = { scopeKey, page: identity };
         const ctx: PolicyContext = { url: session.url };
         if (action.ref) {
           const live = await session.describeLiveTarget(action.ref).catch(() => null);
@@ -316,25 +316,27 @@ export function buildMcpServer(
           // (via the bridge UI "Pending confirmations" or
           // `node dist/index.js approve <id> --yes`) is honored on retry.
           // Approvals are single-use, expire after 10 minutes, and are
-          // voided by navigation or snapshot rotation.
+          // voided by ANY navigation (including same-URL goto/reload) or
+          // snapshot rotation.
           if (!confirmations.isApproved(scope, action)) {
             const existing: PendingConfirmation | undefined = confirmations
               .listUnresolved()
               .find(
                 (c) =>
                   c.taskId === scopeKey &&
-                  c.pageFingerprint === fingerprint &&
+                  pageIdentityEquals(c.page, identity) &&
                   sameAction(c.action, action),
               );
             const ticket =
               existing ??
-              confirmations.request(scopeKey, action, decision.reason, decision.risk, fingerprint);
+              confirmations.request(scopeKey, action, decision.reason, decision.risk, identity);
             return errText(
               `requires human confirmation (${decision.reason}). Confirmation ticket ` +
                 `${ticket.id} registered — approve with: node dist/index.js approve ${ticket.id} ` +
                 `--yes (or the bridge UI "Pending confirmations"), then retry this tool. ` +
-                `The approval covers only this exact call (same arguments, same page, ` +
-                `same session) and is single-use.`,
+                `The approval covers only this exact call (same arguments, same page ` +
+                `state, same session) and is single-use; any navigation — even to the ` +
+                `same URL — voids it.`,
             );
           }
         }

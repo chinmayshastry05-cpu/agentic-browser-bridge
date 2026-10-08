@@ -262,6 +262,21 @@ export abstract class PageBackendBase implements BrowserBackend {
     return this.requirePage().title();
   }
 
+  /**
+   * Live identity of the loaded document: the document's creation
+   * timestamp. A new document (any navigation, including same-URL reload)
+   * always gets a new value, so a fingerprint containing it cannot be
+   * replayed against a rebuilt page.
+   */
+  async pageLoadId(): Promise<string | null> {
+    try {
+      const t = await this.requirePage().evaluate(() => performance.timeOrigin);
+      return typeof t === 'number' && Number.isFinite(t) ? String(t) : null;
+    } catch {
+      return null;
+    }
+  }
+
   async pageInfo(): Promise<PageInfo> {
     const page = this.requirePage();
     const description = await page

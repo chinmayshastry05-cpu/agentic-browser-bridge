@@ -26,6 +26,7 @@ import {
   type DownloadRecord,
   type ElementDescriptor,
   type FrameInfo,
+  type PageIdentity,
   type PageInfo,
   type PageSnapshot,
   type TabInfo,
@@ -33,6 +34,7 @@ import {
 import { PlaywrightBackend } from './browser/playwright-backend.js';
 import { CdpBackend } from './browser/cdp-backend.js';
 import { reground, signatureMatches } from './perception/grounding.js';
+import { randomUUID } from 'node:crypto';
 
 export { PlaywrightBackend, CdpBackend };
 
@@ -57,6 +59,22 @@ export class BrowserSession {
   private readonly backend: BrowserBackend;
   private targetByRef = new Map<string, { descriptor: ElementDescriptor; selector: string; frameId?: string }>();
   private lastSnapshot: PageSnapshot | null = null;
+  /**
+   * Monotonic navigation generation. Incremented on EVERY committed
+   * navigation — goto, reload, back/forward, tab open/switch/close —
+   * including same-URL navigations where the URL does not change. Feeds
+   * the approval fingerprint so no approval or pending ticket survives
+   * any navigation.
+   */
+  private navGeneration = 0;
+  /**
+   * Fresh random value per committed navigation, mixed with the backend's
+   * live page identity when available. Guarantees the page identity is
+   * never replayable, even across process restarts.
+   */
+  private pageNonce: string = randomUUID();
+  /** URL observed at the last committed navigation/snapshot (SPA detection). */
+  private lastNavUrl: string | null = null;
 
   constructor(id: string, backend: BrowserBackend = new PlaywrightBackend()) {
     this.id = id;
@@ -69,6 +87,44 @@ export class BrowserSession {
 
   get isUserBrowser(): boolean {
     return this.backend.isUserBrowser;
+  }
+
+  /**
+   * The exact page identity approvals bind to. Compared field-wise; any
+   * navigation changes navGeneration (and pageNonce), voiding approvals.
+   */
+  pageIdentity(): PageIdentity {
+    return {
+      url: this.backend.currentUrl(),
+      snapshotId: this.lastSnapshot?.snapshotId ?? null,
+      navGeneration: this.navGeneration,
+      pageNonce: this.pageNonce,
+    };
+  }
+
+  /**
+   * Must run after EVERY committed navigation (including same-URL goto and
+   * reload, and tab open/switch/close): bumps the generation, mints a fresh
+   * page nonce (mixed with the backend's live document identity when the
+   * backend can provide one), and clears all refs — a ref from before a
+   * navigation must never resolve against the rebuilt DOM.
+   */
+  private async onNavigationCommitted(): Promise<void> {
+    this.navGeneration += 1;
+    this.targetByRef.clear();
+    this.lastSnapshot = null;
+    let liveId: string | null = null;
+    try {
+      liveId = (await this.backend.pageLoadId?.()) ?? null;
+    } catch {
+      liveId = null;
+    }
+    this.pageNonce = liveId ? `${randomUUID()}:${liveId}` : randomUUID();
+    try {
+      this.lastNavUrl = this.backend.currentUrl();
+    } catch {
+      this.lastNavUrl = null;
+    }
   }
 
   async start(opts: BrowserStartOptions): Promise<void> {
@@ -91,21 +147,25 @@ export class BrowserSession {
       throw new Error(`refusing to navigate to non-web URL: ${url}`);
     }
     await this.backend.goto(url);
+    await this.onNavigationCommitted();
     return { url: this.backend.currentUrl(), title: await this.backend.title() };
   }
 
   async goBack(): Promise<{ url: string }> {
     await this.backend.goBack();
+    await this.onNavigationCommitted();
     return { url: this.backend.currentUrl() };
   }
 
   async goForward(): Promise<{ url: string }> {
     await this.backend.goForward();
+    await this.onNavigationCommitted();
     return { url: this.backend.currentUrl() };
   }
 
   async reload(): Promise<{ url: string }> {
     await this.backend.reload();
+    await this.onNavigationCommitted();
     return { url: this.backend.currentUrl() };
   }
 
@@ -114,19 +174,37 @@ export class BrowserSession {
   }
 
   async openTab(url?: string): Promise<TabInfo> {
-    return this.backend.openTab(url);
+    const tab = await this.backend.openTab(url);
+    await this.onNavigationCommitted();
+    return tab;
   }
 
   async switchTab(tabId: string): Promise<TabInfo> {
-    return this.backend.switchTab(tabId);
+    const tab = await this.backend.switchTab(tabId);
+    await this.onNavigationCommitted();
+    return tab;
   }
 
   async closeTab(tabId: string): Promise<void> {
     await this.backend.closeTab(tabId);
+    await this.onNavigationCommitted();
   }
 
   async snapshot(): Promise<PageSnapshot> {
     const snap = await this.backend.snapshot();
+    // Detect page-initiated navigations that bypassed the session methods
+    // (SPA pushState/replaceState, link clicks): any URL change is a
+    // navigation — clear refs and void approvals bound to the old page.
+    if (this.lastNavUrl !== null) {
+      try {
+        if (this.backend.currentUrl() !== this.lastNavUrl) {
+          await this.onNavigationCommitted();
+        }
+      } catch {
+        // If the backend cannot report a URL, keep the existing state.
+      }
+    }
+    this.lastNavUrl = this.backend.currentUrl();
     this.registerSnapshot(snap);
     return snap;
   }
@@ -134,6 +212,16 @@ export class BrowserSession {
   /** Snapshot scoped to one iframe; refs carry that frame's id. */
   async frameSnapshot(frameId: string): Promise<PageSnapshot> {
     const snap = await this.backend.frameSnapshot(frameId);
+    if (this.lastNavUrl !== null) {
+      try {
+        if (this.backend.currentUrl() !== this.lastNavUrl) {
+          await this.onNavigationCommitted();
+        }
+      } catch {
+        // If the backend cannot report a URL, keep the existing state.
+      }
+    }
+    this.lastNavUrl = this.backend.currentUrl();
     this.registerSnapshot(snap);
     return snap;
   }

@@ -278,6 +278,10 @@
         url: location.href,
         title: document.title,
         description: meta ? (meta.getAttribute('content') || '') : '',
+        // Live document identity: changes on every committed navigation
+        // (including same-URL reloads). The bridge mixes it into approval
+        // fingerprints so approvals cannot be replayed against a rebuilt page.
+        loadId: performance.timeOrigin,
       };
     },
     viewportSize() {

@@ -280,10 +280,24 @@ export class ExtensionBackend implements BrowserBackend {
   }
 
   async pageInfo(): Promise<PageInfo> {
-    const info = await this.op<{ url: string; title: string; description: string }>('pageInfo');
+    const info = await this.op<{ url: string; title: string; description: string; loadId?: number }>('pageInfo');
     this.lastUrl = info.url;
     this.lastTitle = info.title;
     return { url: info.url, title: info.title, description: info.description };
+  }
+
+  /**
+   * Live identity of the loaded document, from the content script's
+   * performance.timeOrigin. Changes on every committed navigation,
+   * including same-URL reloads.
+   */
+  async pageLoadId(): Promise<string | null> {
+    try {
+      const info = await this.op<{ loadId?: number }>('pageInfo');
+      return typeof info?.loadId === 'number' && Number.isFinite(info.loadId) ? String(info.loadId) : null;
+    } catch {
+      return null;
+    }
   }
 
   /**

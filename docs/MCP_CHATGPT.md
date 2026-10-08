@@ -14,13 +14,21 @@ local agent loop (including `describeLiveTarget` for password-field context):
 - **What an approval covers (exact, fail-closed):** one approval authorizes
   ONE specific call and nothing else. It binds the canonical FULL tool
   arguments (every argument — e.g. the exact `text` being typed, not just
-  the ref), the page/target fingerprint (`<page URL>::<snapshot id>` at
-  ticket time), and the requesting MCP session. It expires 10 minutes after
-  issuance and is **single-use**: the retry it unblocks consumes it, so the
-  same call a second time needs a fresh ticket. Navigation, or a snapshot
-  rotation (which reassigns refs), voids the approval. Approving
-  `browser_type e4 "hello"` never authorizes `browser_type e4 "goodbye"`,
-  and one session's approval never authorizes another session.
+  the ref), the exact page identity at ticket time (page URL, snapshot id,
+  a monotonic navigation generation, and a per-navigation page nonce), and
+  the requesting MCP session. It expires 10 minutes after issuance and is
+  **single-use**: the retry it unblocks consumes it, so the same call a
+  second time needs a fresh ticket. **ANY navigation voids the approval —
+  even to the identical URL:** `browser_navigate`, `browser_reload`,
+  `browser_back`/`browser_forward`, and tab open/switch/close each bump the
+  navigation generation, mint a fresh page nonce, and clear all element
+  refs. An old ref after navigation fails with the "stale ref — take a
+  fresh snapshot" error and can never resolve against the rebuilt DOM.
+  Approving `browser_type e4 "hello"` never authorizes
+  `browser_type e4 "goodbye"`, and one session's approval never authorizes
+  another session. Concurrent approval checks across processes (MCP server
+  + `approve` CLI share the file-backed queue) are serialized with a
+  lockfile, so racing the same ticket produces exactly one winner.
 - **What is NOT protected:** a bare "Send"/"Submit" click whose label
   matches no consequential keyword is low-risk and proceeds without
   confirmation; icon-only buttons with no accessible name are NOT caught by

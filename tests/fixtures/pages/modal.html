@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Fixture A — Blocking modal</title>
+<style>
+  #pageBtn { margin: 40px; padding: 12px 24px; }
+  dialog { border: 2px solid #333; padding: 24px; }
+  dialog::backdrop { background: rgba(0,0,0,0.6); }
+</style>
+</head>
+<body>
+  <h1>Modal fixture</h1>
+  <button id="pageBtn" onclick="document.getElementById('out').textContent='background clicked'">Background action</button>
+  <input id="pageInput" placeholder="background input" />
+  <p id="out"></p>
+
+  <dialog id="loginDialog" aria-label="Login required">
+    <h2>Login required</h2>
+    <p>Please accept to continue.</p>
+    <button id="acceptBtn">Accept</button>
+    <button id="closeBtn">Close</button>
+  </dialog>
+  <script>
+    // Open as a true modal: native showModal blocks pointer events to the page.
+    document.getElementById('loginDialog').showModal();
+    document.getElementById('acceptBtn').addEventListener('click', () => {
+      document.getElementById('out').textContent = 'dialog accepted';
+      document.getElementById('loginDialog').close();
+    });
+    document.getElementById('closeBtn').addEventListener('click', () => {
+      document.getElementById('loginDialog').close();
+    });
+  </script>
+</body>
+</html>

@@ -57,6 +57,7 @@ const PAGE_OPS = new Set([
   'snapshot', 'click', 'dblclick', 'type', 'clear', 'pressKey', 'hover', 'focus',
   'scrollIntoView', 'scrollBy', 'selectOption', 'setChecked', 'waitForSelector',
   'pageText', 'pageInfo', 'viewportSize', 'listFrames', 'describeTarget', 'elementFromPoint',
+  'hitTest',
 ]);
 
 async function getWsUrl() {

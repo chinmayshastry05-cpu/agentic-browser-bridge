@@ -62,6 +62,8 @@ export interface RawNode {
   parentRef: string | null;
   boundingBox: { x: number; y: number; width: number; height: number } | null;
   visible: boolean;
+  /** True when this element held keyboard focus at snapshot time. */
+  focused?: boolean;
   /** Present when the node lives inside a frame or shadow root. */
   frameId?: string;
 }
@@ -96,6 +98,7 @@ export function domWalker({ interactableSel, structuralSel, refAttr, scopeLabel 
         parentRef: string | null;
         boundingBox: { x: number; y: number; width: number; height: number } | null;
         visible: boolean;
+        focused: boolean;
         frameId?: string;
       }> = [];
       let counter = 0;
@@ -244,6 +247,7 @@ export function domWalker({ interactableSel, structuralSel, refAttr, scopeLabel 
               ? { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
               : null,
           visible,
+          focused: el === document.activeElement,
           ...(scopeLabel ? { frameId: scopeLabel } : {}),
         });
         // Recurse into nested interactables/structural elements, and pierce
@@ -331,6 +335,7 @@ export function assembleNodes(raw: RawNode[]): DomNode[] {
     childrenRefs: raw.filter((c) => c.parentRef === n.ref).map((c) => c.ref),
     boundingBox: n.boundingBox,
     visible: n.visible,
+    focused: n.focused,
     ...(n.frameId ? { frameId: n.frameId } : {}),
   }));
   for (const n of nodes) {

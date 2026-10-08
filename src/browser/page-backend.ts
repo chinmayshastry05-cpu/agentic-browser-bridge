@@ -567,11 +567,133 @@ export abstract class PageBackendBase implements BrowserBackend {
         }
         const inputType = el.getAttribute('type');
         if (inputType) out.inputType = inputType.toLowerCase();
+        // Document identity owning this element: lets the session detect a
+        // document replacement (reload/navigation) between snapshot and
+        // action even when the URL did not change.
+        (out as { docLoadId?: string | null }).docLoadId =
+          typeof performance !== 'undefined' && Number.isFinite(performance.timeOrigin)
+            ? String(performance.timeOrigin)
+            : null;
         return out;
       });
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Browser-native actionability check via document.elementFromPoint,
+   * mirroring the extension content script's hitTest op. Reports whether
+   * the target is actually reachable or blocked by a visible modal/dialog,
+   * overlay, or backdrop — never dismisses anything.
+   */
+  async hitTest(
+    selector: string,
+    frameId?: string,
+  ): Promise<import('../types.js').HitTestResult> {
+    const { page, frame } = this.frameFor(frameId);
+    const scope = frame ?? page;
+    return scope.evaluate(
+      (sel: unknown) => {
+        const selector = sel as string;
+        const el = document.querySelector(selector);
+        if (!el) throw new Error(`no element matches selector "${selector}"`);
+        const r = el.getBoundingClientRect();
+        const cs = getComputedStyle(el);
+        const visible =
+          r.width > 0 &&
+          r.height > 0 &&
+          cs.display !== 'none' &&
+          cs.visibility !== 'hidden' &&
+          cs.opacity !== '0';
+        const disabled =
+          (el as HTMLInputElement).disabled === true || el.getAttribute('aria-disabled') === 'true';
+        const accName = (n: Element): string => {
+          const a = n.getAttribute('aria-label');
+          if (a) return a.trim().slice(0, 120);
+          return ((n.textContent ?? '').replace(/\s+/g, ' ').trim()).slice(0, 120);
+        };
+        const info = (n: Element | null) =>
+          n
+            ? { tag: n.tagName.toLowerCase(), role: (n.getAttribute('role') || n.tagName).toLowerCase(), name: accName(n) }
+            : null;
+        const dialogInfo = (d: Element | null) => {
+          if (!d) return null;
+          const modal =
+            d.tagName === 'DIALOG'
+              ? (d as HTMLDialogElement).open === true
+              : d.getAttribute('aria-modal') === 'true';
+          return {
+            role: (d.getAttribute('role') || 'dialog').toLowerCase(),
+            name: accName(d),
+            modal,
+          };
+        };
+        const isVis = (n: Element): boolean => {
+          const b = n.getBoundingClientRect();
+          if (b.width === 0 && b.height === 0) return false;
+          const s = getComputedStyle(n);
+          return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+        };
+        const base = {
+          target: info(el)!,
+          targetVisible: visible,
+          targetDisabled: disabled,
+        };
+        if (!visible) return { actionable: false, reason: 'not-visible', ...base };
+        if (disabled) return { actionable: false, reason: 'disabled', ...base };
+        const topModal =
+          Array.from(document.querySelectorAll('dialog[open], [role="dialog"]'))
+            .filter(isVis)
+            .find((d) => d.tagName === 'DIALOG' || d.getAttribute('aria-modal') === 'true') || null;
+        const ownDialog = el.closest('dialog, [role="dialog"]');
+        if (topModal && ownDialog !== topModal && !(ownDialog && topModal.contains(ownDialog))) {
+          return {
+            actionable: false,
+            reason: 'outside-active-dialog',
+            dialog: dialogInfo(topModal),
+            ...base,
+          };
+        }
+        const inset = 2;
+        const pts: Array<[number, number]> = [
+          [r.x + r.width / 2, r.y + r.height / 2],
+          [r.x + inset, r.y + inset],
+          [r.x + r.width - inset, r.y + inset],
+          [r.x + inset, r.y + r.height - inset],
+          [r.x + r.width - inset, r.y + r.height - inset],
+        ];
+        let occluder: {
+          tag: string;
+          role: string;
+          name: string;
+          dialog: { role: string; name: string; modal: boolean } | null;
+        } | null = null;
+        let centerHit = false;
+        for (let i = 0; i < pts.length; i++) {
+          const [x, y] = pts[i]!;
+          if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) continue;
+          const top = document.elementFromPoint(x, y);
+          const hit = !!top && (top === el || el.contains(top));
+          if (i === 0) centerHit = hit;
+          if (!hit && !occluder && top) {
+            const od = top.closest('dialog, [role="dialog"]');
+            occluder = { ...info(top)!, dialog: dialogInfo(od) };
+          }
+        }
+        if (!centerHit) {
+          return {
+            actionable: false,
+            reason: 'occluded',
+            occluder,
+            dialog: (occluder && occluder.dialog) || dialogInfo(ownDialog),
+            ...base,
+          };
+        }
+        return { actionable: true, dialog: dialogInfo(ownDialog), ...base };
+      },
+      selector,
+    ) as Promise<import('../types.js').HitTestResult>;
   }
 
   async screenshot(path: string): Promise<void> {

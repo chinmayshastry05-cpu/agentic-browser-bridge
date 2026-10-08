@@ -444,6 +444,8 @@ function descriptor(over: Partial<ElementDescriptor> = {}): ElementDescriptor {
     name: 'Greet me',
     tag: 'button',
     selector: '#greet',
+    docGeneration: 0,
+    docLoadId: null,
     ...over,
   };
 }

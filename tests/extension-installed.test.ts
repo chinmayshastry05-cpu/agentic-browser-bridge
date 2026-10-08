@@ -237,4 +237,25 @@ describe.skipIf(!extAvailable)('installed extension smoke (genuine)', () => {
     const text = await session.pageText();
     expect(text).toContain('Hello, Ada!');
   }, 30_000);
+
+  it('hitTest op: real content script reports occlusion behind a modal', async () => {
+    // Genuine content.js hitTest coverage (P0-1): the modal fixture's
+    // native dialog blocks the background button; the dialog's own
+    // button stays actionable.
+    const modalUrl = `file://${resolve(HERE, './fixtures/pages/modal.html')}`;
+    await session.navigate(modalUrl);
+    const backend = (session as unknown as { backend: ExtensionBackend }).backend;
+    const snap = await session.snapshot();
+    const bg = snap.nodes.find((n) => n.name === 'Background action');
+    const accept = snap.nodes.find((n) => n.name === 'Accept');
+    expect(bg).toBeDefined();
+    expect(accept).toBeDefined();
+    const blocked = await backend.hitTest(bg!.selector);
+    expect(blocked.actionable).toBe(false);
+    expect(blocked.reason).toBe('outside-active-dialog');
+    const open = await backend.hitTest(accept!.selector);
+    expect(open.actionable).toBe(true);
+    // And the session gate refuses the click without dismissing the dialog.
+    await expect(session.click(bg!.ref)).rejects.toThrow(/blocked/);
+  }, 30_000);
 });

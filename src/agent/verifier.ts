@@ -148,5 +148,11 @@ export async function verifyAction(
     case 'finish':
     case 'noop':
       return { verified: true, method: 'no-effect-expected', detail: 'no state change expected' };
+
+    default:
+      return unverified(
+        'unsupported-action',
+        `no verifier for action "${(action as AgentAction).action}" — outcome not established`,
+      );
   }
 }

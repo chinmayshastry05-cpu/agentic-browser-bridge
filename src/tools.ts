@@ -10,9 +10,11 @@
  * across the transport boundary unhandled.
  */
 import type { BrowserSession } from './bridge-core.js';
-import { buildTree, renderTree } from './tree.js';
+import { ActionBlockedError } from './bridge-core.js';
+import { buildTree, dialogSubtreeNodes, regionNodes, renderTree } from './tree.js';
 import { analyze } from './analyzer.js';
-import type { McpToolDefinition, ToolResult } from './types.js';
+import { verifyAction } from './agent/verifier.js';
+import type { AgentAction, McpToolDefinition, ToolResult } from './types.js';
 
 export interface ToolHandler {
   definition: McpToolDefinition;
@@ -43,10 +45,51 @@ export function createToolRegistry(session: BrowserSession): Map<string, ToolHan
         try {
           return await handle(args);
         } catch (err) {
+          if (err instanceof ActionBlockedError) {
+            // Structured blocked result: the agent must see WHAT blocks it
+            // (active modal) instead of a bare error string.
+            return {
+              ok: false,
+              error: err.message,
+              data: {
+                blocked: true,
+                reason: err.reason,
+                modal: err.detail.modal,
+                occluder: err.detail.occluder,
+                suggestedNextStep: err.detail.suggestedNextStep,
+              },
+            };
+          }
           return { ok: false, error: (err as Error).message };
         }
       },
     });
+  };
+
+  /**
+   * Run a browser action, then verify its outcome against observable page
+   * state. Distinguishes ACCEPTED (the browser API did not throw) from
+   * VERIFIED (the expected user-visible state change actually happened):
+   * { ok: true } + verification.verified=false means "dispatched but no
+   * observed effect" — never reported as success.
+   */
+  const withVerification = async (
+    action: AgentAction,
+    preUrl: string,
+    run: () => Promise<Record<string, unknown>>,
+  ): Promise<ToolResult> => {
+    const data = await run();
+    let verification;
+    try {
+      verification = await verifyAction(session, action, preUrl);
+    } catch (err) {
+      verification = {
+        verified: false,
+        method: 'error',
+        detail: `verification errored: ${(err as Error).message}`,
+      };
+    }
+    return { ok: true, data: { ...data, accepted: true, verification } };
   };
 
   register(
@@ -58,19 +101,77 @@ export function createToolRegistry(session: BrowserSession): Map<string, ToolHan
       required: ['url'],
     },
     async (args) => {
-      const r = await session.navigate(str(args, 'url'));
-      return { ok: true, data: r };
+      const url = str(args, 'url');
+      const preUrl = session.url;
+      return withVerification({ action: 'navigate', url }, preUrl, async () => {
+        const r = await session.navigate(url);
+        return { navigated: r.url, title: r.title };
+      });
     },
   );
 
   register(
     'browser_snapshot',
-    'Capture the current page: URL, title, and the interactable element tree with stable refs.',
-    { type: 'object', properties: {} },
-    async () => {
+    'Capture the current page: URL, title, and the interactable element tree with stable refs. ' +
+      'Rendering is priority-ordered (active dialog controls and visible interactables first) so ' +
+      'critical controls survive truncation; omitted nodes are counted honestly. ' +
+      'Use dialogOnly for a blocking modal, region for a viewport rectangle, maxNodes to bound output.',
+    {
+      type: 'object',
+      properties: {
+        dialogOnly: {
+          type: 'boolean',
+          description: 'Render only the active dialog subtree (visible dialogs + descendants)',
+        },
+        region: {
+          type: 'object',
+          description: 'Render only nodes intersecting this viewport rectangle (CSS px)',
+          properties: {
+            x: { type: 'number' },
+            y: { type: 'number' },
+            width: { type: 'number' },
+            height: { type: 'number' },
+          },
+          required: ['x', 'y', 'width', 'height'],
+        },
+        maxNodes: {
+          type: 'number',
+          description: 'Maximum rendered nodes (default 120)',
+        },
+      },
+    },
+    async (args) => {
       const snap = await session.snapshot();
       const summary = analyze(snap);
-      const tree = renderTree(buildTree(snap.nodes));
+      let nodes = snap.nodes;
+      let scopeNote = '';
+      if (args['dialogOnly'] === true) {
+        nodes = dialogSubtreeNodes(nodes);
+        scopeNote = 'dialog-scoped';
+      }
+      const region = args['region'];
+      if (region && typeof region === 'object') {
+        const r = region as Record<string, unknown>;
+        if (
+          typeof r['x'] === 'number' &&
+          typeof r['y'] === 'number' &&
+          typeof r['width'] === 'number' &&
+          typeof r['height'] === 'number'
+        ) {
+          nodes = regionNodes(nodes, {
+            x: r['x'] as number,
+            y: r['y'] as number,
+            width: r['width'] as number,
+            height: r['height'] as number,
+          });
+          scopeNote = scopeNote ? `${scopeNote}+region` : 'region-scoped';
+        }
+      }
+      const maxNodes =
+        typeof args['maxNodes'] === 'number' && (args['maxNodes'] as number) > 0
+          ? Math.min(Math.floor(args['maxNodes'] as number), 2000)
+          : 120;
+      const tree = renderTree(buildTree(nodes), 6, maxNodes, { prioritize: true });
       return {
         ok: true,
         data: {
@@ -79,6 +180,8 @@ export function createToolRegistry(session: BrowserSession): Map<string, ToolHan
           capturedAt: snap.capturedAt,
           brief: summary.brief,
           countsByRole: summary.countsByRole,
+          nodeCount: nodes.length,
+          scope: scopeNote || 'full-page',
           tree,
         },
       };
@@ -87,21 +190,28 @@ export function createToolRegistry(session: BrowserSession): Map<string, ToolHan
 
   register(
     'browser_click',
-    'Click the element with the given ref from the latest snapshot.',
+    'Click the element with the given ref from the latest snapshot. ' +
+      'The result distinguishes accepted (dispatched without error) from verified ' +
+      '(an observable page effect was seen) — accepted without verified is NOT success.',
     {
       type: 'object',
       properties: { ref: { type: 'string', description: 'Element ref, e.g. "e3"' } },
       required: ['ref'],
     },
     async (args) => {
-      await session.click(str(args, 'ref'));
-      return { ok: true, data: { clicked: args['ref'] } };
+      const ref = str(args, 'ref');
+      const preUrl = session.url;
+      return withVerification({ action: 'click', ref }, preUrl, async () => {
+        await session.click(ref);
+        return { clicked: ref };
+      });
     },
   );
 
   register(
     'browser_type',
-    'Type text into the element with the given ref (input/textarea/contenteditable). Optionally press Enter after.',
+    'Type text into the element with the given ref (input/textarea/contenteditable). Optionally press Enter after. ' +
+      'The result distinguishes accepted from verified — check verification.verified.',
     {
       type: 'object',
       properties: {
@@ -112,8 +222,14 @@ export function createToolRegistry(session: BrowserSession): Map<string, ToolHan
       required: ['ref', 'text'],
     },
     async (args) => {
-      await session.type(str(args, 'ref'), str(args, 'text'), args['submit'] === true);
-      return { ok: true, data: { typedInto: args['ref'] } };
+      const ref = str(args, 'ref');
+      const text = str(args, 'text');
+      const submit = args['submit'] === true;
+      const preUrl = session.url;
+      return withVerification({ action: 'type', ref, text, submit }, preUrl, async () => {
+        await session.type(ref, text, submit);
+        return { typedInto: ref };
+      });
     },
   );
 
@@ -137,21 +253,39 @@ export function createToolRegistry(session: BrowserSession): Map<string, ToolHan
     'browser_back',
     'Navigate back in the active tab history.',
     { type: 'object', properties: {} },
-    async () => ({ ok: true, data: await session.goBack() }),
+    async () => {
+      const preUrl = session.url;
+      return withVerification({ action: 'back' }, preUrl, async () => {
+        const r = await session.goBack();
+        return { url: r.url };
+      });
+    },
   );
 
   register(
     'browser_forward',
     'Navigate forward in the active tab history.',
     { type: 'object', properties: {} },
-    async () => ({ ok: true, data: await session.goForward() }),
+    async () => {
+      const preUrl = session.url;
+      return withVerification({ action: 'forward' }, preUrl, async () => {
+        const r = await session.goForward();
+        return { url: r.url };
+      });
+    },
   );
 
   register(
     'browser_reload',
     'Reload the active tab.',
     { type: 'object', properties: {} },
-    async () => ({ ok: true, data: await session.reload() }),
+    async () => {
+      const preUrl = session.url;
+      return withVerification({ action: 'reload' }, preUrl, async () => {
+        const r = await session.reload();
+        return { url: r.url };
+      });
+    },
   );
 
   register(
@@ -228,8 +362,12 @@ export function createToolRegistry(session: BrowserSession): Map<string, ToolHan
       required: ['ref'],
     },
     async (args) => {
-      await session.dblclick(str(args, 'ref'));
-      return { ok: true, data: { doubleClicked: args['ref'] } };
+      const ref = str(args, 'ref');
+      const preUrl = session.url;
+      return withVerification({ action: 'double_click', ref }, preUrl, async () => {
+        await session.dblclick(ref);
+        return { doubleClicked: ref };
+      });
     },
   );
 
@@ -242,8 +380,12 @@ export function createToolRegistry(session: BrowserSession): Map<string, ToolHan
       required: ['ref'],
     },
     async (args) => {
-      await session.clear(str(args, 'ref'));
-      return { ok: true, data: { cleared: args['ref'] } };
+      const ref = str(args, 'ref');
+      const preUrl = session.url;
+      return withVerification({ action: 'clear', ref }, preUrl, async () => {
+        await session.clear(ref);
+        return { cleared: ref };
+      });
     },
   );
 
@@ -256,8 +398,12 @@ export function createToolRegistry(session: BrowserSession): Map<string, ToolHan
       required: ['key'],
     },
     async (args) => {
-      await session.pressKey(str(args, 'key'));
-      return { ok: true, data: { pressed: args['key'] } };
+      const key = str(args, 'key');
+      const preUrl = session.url;
+      return withVerification({ action: 'press_key', key }, preUrl, async () => {
+        await session.pressKey(key);
+        return { pressed: key };
+      });
     },
   );
 
@@ -316,8 +462,11 @@ export function createToolRegistry(session: BrowserSession): Map<string, ToolHan
     async (args) => {
       const dx = typeof args['dx'] === 'number' ? args['dx'] : 0;
       const dy = typeof args['dy'] === 'number' ? args['dy'] : 0;
-      await session.scrollBy(dx, dy);
-      return { ok: true, data: { scrolledBy: { dx, dy } } };
+      const preUrl = session.url;
+      return withVerification({ action: 'scroll', dx, dy }, preUrl, async () => {
+        await session.scrollBy(dx, dy);
+        return { scrolledBy: { dx, dy } };
+      });
     },
   );
 
@@ -337,8 +486,13 @@ export function createToolRegistry(session: BrowserSession): Map<string, ToolHan
       if (!Array.isArray(values) || !values.every((v) => typeof v === 'string')) {
         throw new Error('"values" must be an array of strings');
       }
-      const selected = await session.selectOption(str(args, 'ref'), values as string[]);
-      return { ok: true, data: { selected } };
+      const ref = str(args, 'ref');
+      const vals = values as string[];
+      const preUrl = session.url;
+      return withVerification({ action: 'select_option', ref, values: vals }, preUrl, async () => {
+        const selected = await session.selectOption(ref, vals);
+        return { selected };
+      });
     },
   );
 
@@ -355,20 +509,34 @@ export function createToolRegistry(session: BrowserSession): Map<string, ToolHan
     },
     async (args) => {
       if (typeof args['checked'] !== 'boolean') throw new Error('"checked" must be a boolean');
-      await session.setChecked(str(args, 'ref'), args['checked'] as boolean);
-      return { ok: true, data: { ref: args['ref'], checked: args['checked'] } };
+      const ref = str(args, 'ref');
+      const checked = args['checked'] as boolean;
+      const preUrl = session.url;
+      return withVerification({ action: 'check', ref, checked }, preUrl, async () => {
+        await session.setChecked(ref, checked);
+        return { ref, checked };
+      });
     },
   );
 
   register(
     'browser_wait_for',
-    'Wait for a CSS selector to reach a state ("visible"|"hidden"|"attached").',
+    'Wait for a CSS selector to reach a state ("visible"|"hidden"|"attached"). ' +
+      'A generic wait means "the selector currently exists" — it does NOT prove a navigation or ' +
+      'task completed. Pass expectNewDocument=true after an action that should navigate: the wait ' +
+      'then requires the document to change first, so a selector left over on the old page cannot ' +
+      'falsely satisfy it.',
     {
       type: 'object',
       properties: {
         selector: { type: 'string', description: 'CSS selector to wait for' },
         state: { type: 'string', description: 'visible (default), hidden, or attached' },
         timeoutMs: { type: 'number', description: 'Timeout in ms (default 10000)' },
+        expectNewDocument: {
+          type: 'boolean',
+          description:
+            'Require the document (URL or document load id) to change before the selector is evaluated',
+        },
       },
       required: ['selector'],
     },
@@ -378,12 +546,11 @@ export function createToolRegistry(session: BrowserSession): Map<string, ToolHan
       if (!['visible', 'hidden', 'attached'].includes(s)) throw new Error(`bad state "${s}"`);
       const timeoutMs =
         typeof args['timeoutMs'] === 'number' ? (args['timeoutMs'] as number) : 10_000;
-      await session.waitForSelector(
-        str(args, 'selector'),
-        s as 'visible' | 'hidden' | 'attached',
-        timeoutMs,
-      );
-      return { ok: true, data: { waitedFor: args['selector'], state: s } };
+      const expectNewDocument = args['expectNewDocument'] === true;
+      await session.waitForSelector(str(args, 'selector'), s as 'visible' | 'hidden' | 'attached', timeoutMs, {
+        awaitNewDocument: expectNewDocument,
+      });
+      return { ok: true, data: { waitedFor: args['selector'], state: s, expectNewDocument } };
     },
   );
 
@@ -426,7 +593,7 @@ export function createToolRegistry(session: BrowserSession): Map<string, ToolHan
     async (args) => {
       const snap = await session.frameSnapshot(str(args, 'frameId'));
       const summary = analyze(snap);
-      const tree = renderTree(buildTree(snap.nodes));
+      const tree = renderTree(buildTree(snap.nodes), 6, 120, { prioritize: true });
       return {
         ok: true,
         data: {

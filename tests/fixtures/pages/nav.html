@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Fixture D/E — Nav source</title></head>
+<body>
+  <h1>Welcome</h1>
+  <p id="marker">source page</p>
+  <a id="goLink" href="/nav2.html">Go to page two</a>
+  <button id="noopBtn">Does nothing</button>
+  <button id="reloadBtn">Reload this page</button>
+  <script>
+    document.getElementById('noopBtn').addEventListener('click', () => {
+      // Intentionally no state change: for accepted-vs-verified tests.
+    });
+    document.getElementById('reloadBtn').addEventListener('click', () => {
+      location.reload();
+    });
+  </script>
+</body>
+</html>

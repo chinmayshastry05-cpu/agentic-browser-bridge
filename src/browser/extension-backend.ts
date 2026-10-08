@@ -33,6 +33,7 @@ import type {
   BrowserStartOptions,
   DownloadRecord,
   FrameInfo,
+  HitTestResult,
   PageInfo,
   PageSnapshot,
   TabInfo,
@@ -47,6 +48,27 @@ interface ExtTab {
   url: string;
   title: string;
   active: boolean;
+}
+
+/** Bounded post-click readiness: event-driven, never an arbitrary sleep. */
+const POST_ACTION_SETTLE_MS = 4000;
+/** Retry budget for one transient-unreachable recovery. */
+const READINESS_RETRY_MS = 5000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * True when the error is the transient "content script is gone because the
+ * document is being replaced" failure — as opposed to a real page/op error.
+ * Background wraps sendToTab failures as "... (tab may be a chrome:// page
+ * where scripting is blocked)"; only the connection-establishment half is
+ * transient.
+ */
+function isTransientUnreachable(err: unknown): boolean {
+  const m = err instanceof Error ? err.message : String(err);
+  return /could not establish connection|receiving end does not exist|empty response from content script/i.test(m);
 }
 
 function asTab(t: unknown): ExtTab {
@@ -115,6 +137,82 @@ export class ExtensionBackend implements BrowserBackend {
 
   private async op<T>(op: string, params: Record<string, unknown> = {}): Promise<T> {
     return (await this.relay.sendOp(op, params)) as T;
+  }
+
+  /**
+   * Content-script op with transient-readiness recovery. When the document
+   * is being replaced (click-driven navigation, reload), the content
+   * script briefly disappears and the op fails with a connection error.
+   * That transient is not a final failure: poll for the content script to
+   * come back (bounded), then retry the op once. Genuine page/op errors
+   * are never retried.
+   */
+  private async pageOp<T>(op: string, params: Record<string, unknown> = {}): Promise<T> {
+    try {
+      return await this.op<T>(op, params);
+    } catch (err) {
+      if (!isTransientUnreachable(err)) throw err;
+      await this.waitForContentScript(READINESS_RETRY_MS).catch(() => undefined);
+      return this.op<T>(op, params);
+    }
+  }
+
+  /**
+   * Wait until the active tab's content script answers again (bounded).
+   * Used after actions that may trigger navigation and to recover from
+   * transient unreachable failures. Event-driven polling — no arbitrary
+   * long sleeps.
+   */
+  private async waitForContentScript(timeoutMs: number): Promise<void> {
+    const start = Date.now();
+    for (;;) {
+      const ok = await this.op<{ url: string }>('pageInfo').then(
+        () => true,
+        () => false,
+      );
+      if (ok) return;
+      if (Date.now() - start >= timeoutMs) {
+        throw new Error(`content script did not become ready within ${timeoutMs}ms`);
+      }
+      await sleep(150);
+    }
+  }
+
+  /**
+   * Post-action settle for actions that may trigger navigation (click,
+   * dblclick, type-with-submit, pressKey). Polls the live document
+   * identity: if the document was replaced, waits for the new content
+   * script to be ready; if the same document is still there, returns
+   * immediately. Bounded and best-effort — never fails the action that
+   * just succeeded.
+   */
+  private async settleAfterAction(preLoadId: string | null): Promise<void> {
+    const start = Date.now();
+    for (;;) {
+      const live = await this.livePageIdentity().catch(() => null);
+      if (live) {
+        if (live.pageLoadId !== preLoadId) {
+          // New document (or first observation): wait for its content script.
+          const remaining = POST_ACTION_SETTLE_MS - (Date.now() - start);
+          if (remaining > 0) await this.waitForContentScript(remaining).catch(() => undefined);
+        }
+        return;
+      }
+      if (Date.now() - start >= POST_ACTION_SETTLE_MS) return;
+      await sleep(150);
+    }
+  }
+
+  /** Current document load id, or null when the content script is unreachable. */
+  private async currentLoadId(): Promise<string | null> {
+    try {
+      const info = await this.op<{ loadId?: number }>('pageInfo');
+      return typeof info?.loadId === 'number' && Number.isFinite(info.loadId)
+        ? String(info.loadId)
+        : null;
+    } catch {
+      return null;
+    }
   }
 
   private bridgeTabId(extId: string): string {
@@ -194,7 +292,7 @@ export class ExtensionBackend implements BrowserBackend {
   }
 
   async snapshot(): Promise<PageSnapshot> {
-    const raw = (await this.op<{ url: string; title: string; nodes: RawNode[] }>('snapshot')).nodes;
+    const raw = (await this.pageOp<{ url: string; title: string; nodes: RawNode[] }>('snapshot')).nodes;
     const info = await this.pageInfo().catch(() => null);
     const url = info?.url ?? this.lastUrl;
     const title = info?.title ?? this.lastTitle;
@@ -211,57 +309,65 @@ export class ExtensionBackend implements BrowserBackend {
 
   async click(selector: string, frameId?: string): Promise<void> {
     this.noFrames(frameId);
-    await this.op('click', { selector });
+    const pre = await this.currentLoadId();
+    await this.pageOp('click', { selector });
+    await this.settleAfterAction(pre);
   }
 
   async dblclick(selector: string, frameId?: string): Promise<void> {
     this.noFrames(frameId);
-    await this.op('dblclick', { selector });
+    const pre = await this.currentLoadId();
+    await this.pageOp('dblclick', { selector });
+    await this.settleAfterAction(pre);
   }
 
   async type(selector: string, text: string, submit: boolean, frameId?: string): Promise<void> {
     this.noFrames(frameId);
-    await this.op('type', { selector, text, submit });
+    const pre = await this.currentLoadId();
+    await this.pageOp('type', { selector, text, submit });
+    await this.settleAfterAction(pre);
   }
 
   async clear(selector: string, frameId?: string): Promise<void> {
     this.noFrames(frameId);
-    await this.op('clear', { selector });
+    await this.pageOp('clear', { selector });
   }
 
   async pressKey(key: string, frameId?: string): Promise<void> {
     this.noFrames(frameId);
     // Synthetic KeyboardEvent via the content script (untrusted input).
-    await this.op('pressKey', { key });
+    const pre = await this.currentLoadId();
+    await this.pageOp('pressKey', { key });
+    await this.settleAfterAction(pre);
   }
 
   async hover(selector: string, frameId?: string): Promise<void> {
     this.noFrames(frameId);
-    await this.op('hover', { selector });
+    await this.pageOp('hover', { selector });
   }
 
   async focus(selector: string, frameId?: string): Promise<void> {
     this.noFrames(frameId);
-    await this.op('focus', { selector });
+    await this.pageOp('focus', { selector });
   }
 
   async scrollIntoView(selector: string, frameId?: string): Promise<void> {
     this.noFrames(frameId);
-    await this.op('scrollIntoView', { selector });
+    await this.pageOp('scrollIntoView', { selector });
   }
 
   async selectOption(selector: string, values: string[], frameId?: string): Promise<string[]> {
     this.noFrames(frameId);
-    return this.op<string[]>('selectOption', { selector, values });
+    return this.pageOp<string[]>('selectOption', { selector, values });
   }
 
   async setChecked(selector: string, checked: boolean, frameId?: string): Promise<void> {
     this.noFrames(frameId);
-    await this.op('setChecked', { selector, checked });
+    await this.pageOp('setChecked', { selector, checked });
   }
 
   async scrollBy(dx: number, dy: number): Promise<void> {
-    await this.op('scrollBy', { dx, dy });
+    await this.pageOp('scrollBy', { dx, dy });
   }
 
   async waitForSelector(
@@ -271,16 +377,16 @@ export class ExtensionBackend implements BrowserBackend {
     frameId?: string,
   ): Promise<void> {
     this.noFrames(frameId);
-    await this.op('waitForSelector', { selector, state, timeoutMs });
+    await this.pageOp('waitForSelector', { selector, state, timeoutMs });
   }
 
   async pageText(selector?: string, frameId?: string): Promise<string> {
     this.noFrames(frameId);
-    return this.op<string>('pageText', selector ? { selector } : {});
+    return this.pageOp<string>('pageText', selector ? { selector } : {});
   }
 
   async pageInfo(): Promise<PageInfo> {
-    const info = await this.op<{ url: string; title: string; description: string; loadId?: number }>('pageInfo');
+    const info = await this.pageOp<{ url: string; title: string; description: string; loadId?: number }>('pageInfo');
     this.lastUrl = info.url;
     this.lastTitle = info.title;
     return { url: info.url, title: info.title, description: info.description };
@@ -293,7 +399,7 @@ export class ExtensionBackend implements BrowserBackend {
    */
   async pageLoadId(): Promise<string | null> {
     try {
-      const info = await this.op<{ loadId?: number }>('pageInfo');
+      const info = await this.pageOp<{ loadId?: number }>('pageInfo');
       return typeof info?.loadId === 'number' && Number.isFinite(info.loadId) ? String(info.loadId) : null;
     } catch {
       return null;
@@ -309,7 +415,7 @@ export class ExtensionBackend implements BrowserBackend {
    * the cached URL as a side effect (currentUrl() alone is cached).
    */
   async livePageIdentity(): Promise<{ url: string; pageLoadId: string | null }> {
-    const info = await this.op<{ url?: string; loadId?: number }>('pageInfo');
+    const info = await this.pageOp<{ url?: string; loadId?: number }>('pageInfo');
     const loadId =
       typeof info?.loadId === 'number' && Number.isFinite(info.loadId) ? String(info.loadId) : null;
     if (typeof info?.url === 'string' && info.url) this.lastUrl = info.url;
@@ -322,11 +428,11 @@ export class ExtensionBackend implements BrowserBackend {
    * null instead of throwing.
    */
   async viewportSize(): Promise<{ width: number; height: number }> {
-    return this.op<{ width: number; height: number }>('viewportSize');
+    return this.pageOp<{ width: number; height: number }>('viewportSize');
   }
 
   async elementFromPoint(x: number, y: number): Promise<PointHit | null> {
-    return this.op<PointHit | null>('elementFromPoint', { x, y });
+    return this.pageOp<PointHit | null>('elementFromPoint', { x, y });
   }
 
   /** Expose a GroundingSource view of this backend for visual perceptors. */
@@ -349,8 +455,22 @@ export class ExtensionBackend implements BrowserBackend {
 
   async describeTarget(selector: string, frameId?: string): Promise<TargetDescription | null> {
     this.noFrames(frameId);
-    return this.op<TargetDescription | null>('describeTarget', { selector });
+    return this.pageOp<TargetDescription | null>('describeTarget', { selector });
   }
+
+  /**
+   * Browser-native actionability check via the content script's hitTest op
+   * (document.elementFromPoint at representative points). Reports whether
+   * the target is actually reachable or blocked by a modal/overlay —
+   * never dismisses anything.
+   */
+  async hitTest(selector: string, frameId?: string): Promise<HitTestResult> {
+    this.noFrames(frameId);
+    return this.pageOp<HitTestResult>('hitTest', { selector });
+  }
+
+  /** Matches Chrome's captureVisibleTab per-second quota (see screenshot()). */
+  readonly screenshotMinIntervalMs = 1000;
 
   async uploadFile(_selector: string, _filePath: string, _frameId?: string): Promise<void> {
     throw new Error(

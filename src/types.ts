@@ -27,6 +27,8 @@ export interface DomNode {
   boundingBox?: { x: number; y: number; width: number; height: number } | null;
   /** Whether the element is rendered and not hidden. */
   visible: boolean;
+  /** True when this element held keyboard focus at snapshot time. */
+  focused?: boolean;
   /**
    * Frame context for the node. Undefined for top-frame nodes; set to a
    * frame id for nodes captured inside an iframe / shadow scope.
@@ -223,6 +225,47 @@ export interface BrowserBackend {
    * it and the session falls back to currentUrl() + pageLoadId().
    */
   livePageIdentity?(): Promise<{ url: string; pageLoadId: string | null }>;
+  /**
+   * Browser-native actionability (hit-test) check for one element, using
+   * document.elementFromPoint at representative points of the target's
+   * bounding box. Reports whether the target is actually reachable in the
+   * current rendered state, or whether a visible modal/dialog, overlay, or
+   * backdrop owns the hit instead. Never hides, removes, or dismisses
+   * anything — it only reports. Optional: backends that cannot hit-test
+   * omit it and the session skips the pre-action occlusion gate
+   * (documented degradation; all production backends implement it).
+   */
+  hitTest?(selector: string, frameId?: string): Promise<HitTestResult>;
+  /**
+   * Minimum enforced interval between screenshot captures, in
+   * milliseconds. The extension backend sets this to match Chrome's
+   * captureVisibleTab per-second quota; backends without a quota omit it
+   * (or return 0) and captures are only serialized, never delayed.
+   */
+  readonly screenshotMinIntervalMs?: number;
+}
+
+/** Result of a browser-native hit-test before acting on an element. */
+export interface HitTestResult {
+  /** True when the target is reachable at its center point. */
+  actionable: boolean;
+  /** Why the target is not actionable (present when actionable is false). */
+  reason?: 'not-visible' | 'disabled' | 'occluded' | 'outside-active-dialog';
+  target: { tag: string; role: string; name: string };
+  targetVisible: boolean;
+  targetDisabled: boolean;
+  /** The topmost element that owns the hit instead of the target. */
+  occluder?: { tag: string; role: string; name: string; dialog?: HitTestDialog | null } | null;
+  /** The dialog involved: the target's own, or the blocking one. */
+  dialog?: HitTestDialog | null;
+}
+
+/** A dialog relevant to a hit-test: the target's own or the active blocker. */
+export interface HitTestDialog {
+  role: string;
+  name: string;
+  /** True for native <dialog open> or aria-modal="true" dialogs. */
+  modal: boolean;
 }
 
 export interface BrowserStartOptions {
@@ -260,6 +303,13 @@ export interface TargetDescription {
   checked?: boolean;
   /** The input's type attribute (e.g. "password") — used by the policy engine. */
   inputType?: string;
+  /**
+   * Document load id (performance.timeOrigin) of the document that owns
+   * the described element, when the backend can report it. Lets the
+   * session detect that the document was replaced between snapshot and
+   * action (reload, navigation) even when the URL did not change.
+   */
+  docLoadId?: string | null;
 }
 
 /**
@@ -275,6 +325,16 @@ export interface ElementDescriptor {
   tag: string;
   selector: string;
   text?: string;
+  /**
+   * Document identity the ref was captured against. The session's
+   * navigation generation at snapshot time, plus the document load id
+   * baseline (null when the backend cannot report one). Before acting,
+   * the live document is compared against these: a changed document
+   * (reload, navigation, SPA replacement) invalidates the ref — it is
+   * never silently re-ground against the new document.
+   */
+  docGeneration: number;
+  docLoadId: string | null;
 }
 
 /** One browser tab/page known to the backend. */

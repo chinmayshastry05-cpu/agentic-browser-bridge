@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Fixture F — SPA route change</title></head>
+<body>
+  <h1>SPA fixture</h1>
+  <nav>
+    <button id="routeBtn">Go to route two</button>
+  </nav>
+  <div id="app"><p id="routeMarker">route one</p><button id="routeOneBtn">Route one action</button></div>
+  <script>
+    // SPA-style route change: pushState + full DOM replacement of #app.
+    // performance.timeOrigin does NOT change (same document).
+    document.getElementById('routeBtn').addEventListener('click', () => {
+      history.pushState({}, '', '/spa-route-two');
+      document.getElementById('app').innerHTML =
+        '<p id="routeMarker">route two</p><button id="routeTwoBtn">Route two action</button>';
+    });
+    window.addEventListener('popstate', () => {
+      document.getElementById('app').innerHTML = '<p id="routeMarker">route one</p>';
+    });
+  </script>
+</body>
+</html>

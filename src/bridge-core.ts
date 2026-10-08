@@ -26,6 +26,7 @@ import {
   type DownloadRecord,
   type ElementDescriptor,
   type FrameInfo,
+  type HitTestResult,
   type PageIdentity,
   type PageInfo,
   type PageSnapshot,
@@ -37,14 +38,68 @@ import { reground, signatureMatches } from './perception/grounding.js';
 import { randomUUID } from 'node:crypto';
 
 /**
+ * Thrown by the pre-action occlusion gate when a browser-native hit-test
+ * finds the target blocked by a visible modal/dialog, overlay, or backdrop.
+ * Carries structured detail so tools can report blocked/awaiting_user_input
+ * with reason=active_modal instead of a bare error string.
+ *
+ * The gate NEVER hides, removes, clicks through, or auto-dismisses the
+ * blocker — dismissing a dialog is a separate, explicit, policy-gated
+ * action (or the operator's job).
+ */
+export class ActionBlockedError extends Error {
+  readonly blocked = true;
+  readonly reason = 'active_modal' as const;
+  readonly detail: {
+    ref: string;
+    hitReason: string;
+    modal: { role: string; name: string; modal: boolean } | null;
+    occluder: { tag: string; role: string; name: string } | null;
+    suggestedNextStep: string;
+  };
+
+  constructor(ref: string, hit: HitTestResult) {
+    const modalName = hit.dialog?.name ? ` "${hit.dialog.name}"` : '';
+    const why =
+      hit.reason === 'outside-active-dialog'
+        ? `an active modal dialog${modalName} owns the page`
+        : hit.reason === 'occluded'
+          ? `another element${hit.occluder?.name ? ` ("${hit.occluder.name}")` : ''} covers the target`
+          : hit.reason === 'disabled'
+            ? 'the target is disabled'
+            : 'the target is not visible';
+    super(
+      `action on ref "${ref}" blocked: ${why} — refusing to act behind an active blocker. ` +
+        `Handle the dialog explicitly (or ask the user) before using background controls.`,
+    );
+    this.name = 'ActionBlockedError';
+    this.detail = {
+      ref,
+      hitReason: hit.reason ?? 'unknown',
+      modal: hit.dialog ?? null,
+      occluder: hit.occluder
+        ? { tag: hit.occluder.tag, role: hit.occluder.role, name: hit.occluder.name }
+        : null,
+      suggestedNextStep:
+        'User interaction required — dismiss or complete the blocking dialog explicitly before retrying background controls.',
+    };
+  }
+}
+
+/**
  * Extract the live document load id embedded in a page nonce
  * (`<uuid>:<loadId>`), minted by onNavigationCommitted when the backend
  * could report one. Null for bare nonces (initial session state, or
  * backends without pageLoadId).
  */
+function liveLoadIdOfNonce(pageNonce: string): string | null {
+  const i = pageNonce.indexOf(':');
+  return i >= 0 ? pageNonce.slice(i + 1) : null;
+}
+
+/** Same as liveLoadIdOfNonce, for a full PageIdentity. */
 function liveLoadIdOf(identity: PageIdentity): string | null {
-  const i = identity.pageNonce.indexOf(':');
-  return i >= 0 ? identity.pageNonce.slice(i + 1) : null;
+  return liveLoadIdOfNonce(identity.pageNonce);
 }
 
 export { PlaywrightBackend, CdpBackend };
@@ -207,18 +262,29 @@ export class BrowserSession {
   async snapshot(): Promise<PageSnapshot> {
     const snap = await this.backend.snapshot();
     // Detect page-initiated navigations that bypassed the session methods
-    // (SPA pushState/replaceState, link clicks): any URL change is a
-    // navigation — clear refs and void approvals bound to the old page.
-    if (this.lastNavUrl !== null) {
+    // (link clicks, JS redirects, reloads, SPA pushState/replaceState): any
+    // URL change OR document-load-id change is a navigation — clear refs
+    // and void approvals bound to the old page. The load-id check catches
+    // same-URL reloads, where the URL alone does not change.
+    try {
+      const live = await this.readLivePageIdentity();
+      const knownLoadId = liveLoadIdOfNonce(this.pageNonce);
+      const urlChanged =
+        live.url !== null && this.lastNavUrl !== null && live.url !== this.lastNavUrl;
+      const docChanged =
+        live.pageLoadId !== null && knownLoadId !== null && live.pageLoadId !== knownLoadId;
+      if (urlChanged || docChanged) {
+        await this.onNavigationCommitted();
+      }
+      if (live.url !== null) this.lastNavUrl = live.url;
+    } catch {
+      // If the backend cannot report a live identity, keep existing state.
       try {
-        if (this.backend.currentUrl() !== this.lastNavUrl) {
-          await this.onNavigationCommitted();
-        }
+        this.lastNavUrl = this.backend.currentUrl();
       } catch {
-        // If the backend cannot report a URL, keep the existing state.
+        // Leave lastNavUrl as-is.
       }
     }
-    this.lastNavUrl = this.backend.currentUrl();
     this.registerSnapshot(snap);
     return snap;
   }
@@ -303,6 +369,13 @@ export class BrowserSession {
 
   private registerSnapshot(snap: PageSnapshot): void {
     this.targetByRef.clear();
+    // Bind every ref to the document identity observed at snapshot time.
+    // resolveTarget() compares the live document against these before
+    // acting: a changed document (reload/navigation/SPA replacement)
+    // invalidates the ref instead of silently re-grounding against the
+    // new document.
+    const docLoadId = liveLoadIdOfNonce(this.pageNonce);
+    const docGeneration = this.navGeneration;
     for (const n of snap.nodes) {
       const descriptor: ElementDescriptor = {
         ref: n.ref,
@@ -313,6 +386,8 @@ export class BrowserSession {
         tag: n.tag,
         selector: n.selector,
         text: n.text,
+        docGeneration,
+        docLoadId,
       };
       this.targetByRef.set(n.ref, { descriptor, selector: n.selector, frameId: n.frameId });
     }
@@ -332,10 +407,15 @@ export class BrowserSession {
   /**
    * Resolve a ref to a live target, detecting staleness.
    *
-   * 1. Describe the live element behind the stored selector; if its signature
-   *    still matches the descriptor, act directly (confidence 1.0).
-   * 2. Otherwise take a fresh snapshot and attempt semantic re-grounding.
-   * 3. If re-grounding is ambiguous or fails, throw — the caller must
+   * 1. If the live document differs from the one the ref was captured
+   *    against (reload/navigation/SPA replacement — detected via the
+   *    document load id, even when the URL did not change), the ref is
+   *    stale: throw, never re-ground against the new document.
+   * 2. Describe the live element behind the stored selector; if its
+   *    signature still matches the descriptor, act directly (confidence 1.0).
+   * 3. Otherwise take a fresh snapshot and attempt semantic re-grounding
+   *    WITHIN the same document.
+   * 4. If re-grounding is ambiguous or fails, throw — the caller must
    *    re-observe. We never act on a guess.
    */
   async resolveTarget(ref: string): Promise<ResolvedTarget> {
@@ -345,6 +425,21 @@ export class BrowserSession {
       live = await this.backend.describeTarget(t.selector, t.frameId);
     } catch {
       live = null;
+    }
+    const liveDoc = live?.docLoadId ?? null;
+    const knownDoc = t.descriptor.docLoadId;
+    // The document-generation check is scoped to top-frame targets: the
+    // session's live load id is the TOP document's, while a frame target's
+    // docLoadId belongs to its own (sub)document. Comparing them would
+    // false-positive every iframe interaction. Frame-document navigation is
+    // a documented limitation (P1 iframe work deferred); frame targets keep
+    // the pre-existing URL-level protection only.
+    const isTopFrame = t.frameId === undefined || t.frameId === 'top';
+    if (isTopFrame && liveDoc !== null && knownDoc !== null && liveDoc !== knownDoc) {
+      throw new Error(
+        `stale element ref "${ref}" ("${t.descriptor.name}"): the document changed since the ` +
+          `snapshot (reload/navigation) — take a fresh browser_snapshot first`,
+      );
     }
     if (live && signatureMatches(t.descriptor, live)) {
       return { selector: t.selector, frameId: t.frameId, confidence: 1, regrounded: false };
@@ -366,23 +461,51 @@ export class BrowserSession {
     };
   }
 
+  /**
+   * Pre-action occlusion gate. After a ref resolves, uses the backend's
+   * browser-native hit-test (document.elementFromPoint) to verify the
+   * target is actually reachable in the current rendered state — not
+   * hidden behind a visible modal/dialog, overlay, or backdrop, and not
+   * outside the active dialog. Throws ActionBlockedError when blocked.
+   * Backends without hitTest() skip the gate (documented degradation;
+   * all production backends implement it).
+   */
+  private async assertActionable(ref: string, selector: string, frameId?: string): Promise<void> {
+    if (!this.backend.hitTest) return;
+    let hit: HitTestResult;
+    try {
+      hit = await this.backend.hitTest(selector, frameId);
+    } catch {
+      // A failed hit-test must not block legitimate actions: the target
+      // was already resolved and signature-checked by resolveTarget.
+      return;
+    }
+    if (!hit.actionable) {
+      throw new ActionBlockedError(ref, hit);
+    }
+  }
+
   async click(ref: string): Promise<void> {
     const t = await this.resolveTarget(ref);
+    await this.assertActionable(ref, t.selector, t.frameId);
     await this.backend.click(t.selector, t.frameId);
   }
 
   async dblclick(ref: string): Promise<void> {
     const t = await this.resolveTarget(ref);
+    await this.assertActionable(ref, t.selector, t.frameId);
     await this.backend.dblclick(t.selector, t.frameId);
   }
 
   async type(ref: string, text: string, submit = false): Promise<void> {
     const t = await this.resolveTarget(ref);
+    await this.assertActionable(ref, t.selector, t.frameId);
     await this.backend.type(t.selector, text, submit, t.frameId);
   }
 
   async clear(ref: string): Promise<void> {
     const t = await this.resolveTarget(ref);
+    await this.assertActionable(ref, t.selector, t.frameId);
     await this.backend.clear(t.selector, t.frameId);
   }
 
@@ -392,11 +515,13 @@ export class BrowserSession {
 
   async hover(ref: string): Promise<void> {
     const t = await this.resolveTarget(ref);
+    await this.assertActionable(ref, t.selector, t.frameId);
     await this.backend.hover(t.selector, t.frameId);
   }
 
   async focus(ref: string): Promise<void> {
     const t = await this.resolveTarget(ref);
+    await this.assertActionable(ref, t.selector, t.frameId);
     await this.backend.focus(t.selector, t.frameId);
   }
 
@@ -407,11 +532,13 @@ export class BrowserSession {
 
   async selectOption(ref: string, values: string[]): Promise<string[]> {
     const t = await this.resolveTarget(ref);
+    await this.assertActionable(ref, t.selector, t.frameId);
     return this.backend.selectOption(t.selector, values, t.frameId);
   }
 
   async setChecked(ref: string, checked: boolean): Promise<void> {
     const t = await this.resolveTarget(ref);
+    await this.assertActionable(ref, t.selector, t.frameId);
     await this.backend.setChecked(t.selector, checked, t.frameId);
   }
 
@@ -423,8 +550,47 @@ export class BrowserSession {
     selector: string,
     state: 'visible' | 'hidden' | 'attached' = 'visible',
     timeoutMs = 10_000,
+    opts: { awaitNewDocument?: boolean } = {},
   ): Promise<void> {
+    if (opts.awaitNewDocument) {
+      // Generation-aware wait: a selector that already exists on the OLD
+      // page must not satisfy a post-navigation wait. Wait for the document
+      // to change first, then wait for the selector in the new document.
+      await this.waitForDocumentChange(timeoutMs);
+    }
     await this.backend.waitForSelector(selector, state, timeoutMs);
+  }
+
+  /**
+   * Wait until the live document identity differs from the session's
+   * baseline — i.e. a navigation, reload, or SPA document replacement
+   * happened — or the timeout expires. Polls the backend's live identity
+   * (URL + document load id); no arbitrary sleeps, bounded by timeoutMs.
+   */
+  async waitForDocumentChange(timeoutMs: number): Promise<void> {
+    const baselineLoadId = liveLoadIdOfNonce(this.pageNonce);
+    const baselineUrl = this.lastNavUrl ?? this.backend.currentUrl();
+    const start = Date.now();
+    for (;;) {
+      const live = await this.readLivePageIdentity().catch(() => null);
+      if (live) {
+        if (live.url !== null && live.url !== baselineUrl) return;
+        if (
+          live.pageLoadId !== null &&
+          baselineLoadId !== null &&
+          live.pageLoadId !== baselineLoadId
+        ) {
+          return;
+        }
+      }
+      if (Date.now() - start >= timeoutMs) {
+        throw new Error(
+          `timed out after ${timeoutMs}ms waiting for the document to change ` +
+            `(no navigation/reload observed)`,
+        );
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
   }
 
   /**
@@ -467,9 +633,52 @@ export class BrowserSession {
     return this.backend.waitForDownload(timeoutMs);
   }
 
+  /**
+   * Screenshot capture coordinator. Serializes captures through a mutex so
+   * concurrent callers never hit the browser with simultaneous captures,
+   * and enforces the backend's minimum capture interval
+   * (screenshotMinIntervalMs — the extension backend sets 1000ms to match
+   * Chrome's captureVisibleTab per-second quota) by waiting out the
+   * remainder instead of failing. Non-screenshot operations are unaffected;
+   * backends without a quota get serialization only, never added delay.
+   * A raw browser quota error is mapped to an actionable message.
+   */
+  private screenshotMutex: Promise<void> = Promise.resolve();
+  private lastScreenshotAt = 0;
+
   async screenshot(path: string): Promise<{ path: string }> {
-    await this.backend.screenshot(path);
-    return { path };
+    const prev = this.screenshotMutex;
+    let release!: () => void;
+    this.screenshotMutex = new Promise<void>((r) => {
+      release = r;
+    });
+    await prev; // `release` is always called in `finally`, so this never rejects.
+    try {
+      const minInterval = this.backend.screenshotMinIntervalMs ?? 0;
+      if (minInterval > 0) {
+        const elapsed = Date.now() - this.lastScreenshotAt;
+        if (elapsed < minInterval) {
+          await new Promise((r) => setTimeout(r, minInterval - elapsed));
+        }
+      }
+      try {
+        await this.backend.screenshot(path);
+      } catch (err) {
+        const msg = (err as Error).message;
+        if (/capture_visible_tab|capturevisibletab|max_capture/i.test(msg)) {
+          throw new Error(
+            `screenshot rate-limited by the browser (capture quota) — the bridge paces ` +
+              `captures${minInterval > 0 ? ` at ${minInterval}ms intervals` : ''}; ` +
+              `wait briefly and retry: ${msg}`,
+          );
+        }
+        throw err;
+      }
+      this.lastScreenshotAt = Date.now();
+      return { path };
+    } finally {
+      release();
+    }
   }
 
   get url(): string {

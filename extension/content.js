@@ -127,6 +127,7 @@
         boundingBox:
           r.width || r.height ? { x: r.x, y: r.y, width: r.width, height: r.height } : null,
         visible: isVisible(el),
+        focused: el === document.activeElement,
       });
     };
     document.querySelectorAll(`${INTERACTABLE},${STRUCTURAL}`).forEach(push);
@@ -150,6 +151,10 @@
       checked: 'checked' in el ? Boolean(el.checked) : undefined,
       inputType: el.getAttribute('type') || undefined,
       boundingBox: { x: r.x, y: r.y, width: r.width, height: r.height },
+      // Document identity owning this element: lets the bridge detect a
+      // document replacement (reload/navigation) between snapshot and
+      // action even when the URL did not change.
+      docLoadId: String(performance.timeOrigin),
     };
   }
 
@@ -307,6 +312,94 @@
       if (!el) return null;
       const d = describe(el);
       return { selector: uniqueSelector(el), ...d };
+    },
+    /**
+     * hitTest — browser-native actionability check for one element.
+     *
+     * Uses document.elementFromPoint at representative points of the
+     * target's bounding box to determine whether the target is actually
+     * reachable in the current rendered state, or whether a visible
+     * modal/dialog, overlay, or backdrop owns the hit instead.
+     *
+     * Never hides, removes, or dismisses anything — it only reports.
+     * The bridge refuses to act behind an active blocker; dismissing a
+     * dialog is a separate, explicit, policy-gated action.
+     */
+    hitTest({ selector }) {
+      const el = resolve(selector);
+      const r = el.getBoundingClientRect();
+      const cs = getComputedStyle(el);
+      const visible =
+        r.width > 0 && r.height > 0 &&
+        cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0';
+      const disabled = el.disabled === true || el.getAttribute('aria-disabled') === 'true';
+      const info = (node) =>
+        node
+          ? {
+              tag: node.tagName.toLowerCase(),
+              role: roleOf(node),
+              name: accessibleName(node).slice(0, 120),
+            }
+          : null;
+      const dialogInfo = (d) => {
+        if (!d) return null;
+        const modal = d.tagName === 'DIALOG' ? d.open === true : d.getAttribute('aria-modal') === 'true';
+        return {
+          role: (d.getAttribute('role') || 'dialog').toLowerCase(),
+          name: accessibleName(d).slice(0, 120),
+          modal,
+        };
+      };
+      const base = { target: info(el), targetVisible: visible, targetDisabled: disabled };
+      if (!visible) return { actionable: false, reason: 'not-visible', ...base };
+      if (disabled) return { actionable: false, reason: 'disabled', ...base };
+      // Topmost modal dialog in the document: native <dialog open>, or an
+      // aria-modal dialog. A target outside it is not actionable.
+      const topModal =
+        Array.from(document.querySelectorAll('dialog[open], [role="dialog"]'))
+          .filter((d) => isVisible(d))
+          .find((d) => d.tagName === 'DIALOG' || d.getAttribute('aria-modal') === 'true') || null;
+      const ownDialog = el.closest('dialog, [role="dialog"]');
+      if (topModal && ownDialog !== topModal && !(ownDialog && topModal.contains(ownDialog))) {
+        return {
+          actionable: false,
+          reason: 'outside-active-dialog',
+          dialog: dialogInfo(topModal),
+          ...base,
+        };
+      }
+      // Native hit-testing at the center plus inset corners.
+      const inset = 2;
+      const pts = [
+        [r.x + r.width / 2, r.y + r.height / 2],
+        [r.x + inset, r.y + inset],
+        [r.x + r.width - inset, r.y + inset],
+        [r.x + inset, r.y + r.height - inset],
+        [r.x + r.width - inset, r.y + r.height - inset],
+      ];
+      let occluder = null;
+      let centerHit = false;
+      for (let i = 0; i < pts.length; i++) {
+        const [x, y] = pts[i];
+        if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) continue;
+        const top = document.elementFromPoint(x, y);
+        const hit = !!top && (top === el || el.contains(top));
+        if (i === 0) centerHit = hit;
+        if (!hit && !occluder && top) {
+          const od = top.closest('dialog, [role="dialog"]');
+          occluder = { ...info(top), dialog: dialogInfo(od) };
+        }
+      }
+      if (!centerHit) {
+        return {
+          actionable: false,
+          reason: 'occluded',
+          occluder,
+          dialog: (occluder && occluder.dialog) || dialogInfo(ownDialog),
+          ...base,
+        };
+      }
+      return { actionable: true, dialog: dialogInfo(ownDialog), ...base };
     },
   };
 

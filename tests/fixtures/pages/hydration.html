@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Fixture B — Dynamic hydration</title>
+<style>
+  .skeleton { background: #eee; height: 40px; margin: 8px; }
+  #overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.55);
+    display: none; align-items: center; justify-content: center;
+  }
+  #overlay.open { display: flex; }
+  #consentBox { background: #fff; padding: 24px; border: 2px solid #333; }
+</style>
+</head>
+<body>
+  <h1>Hydration fixture</h1>
+  <div id="app">
+    <div class="skeleton"></div>
+    <div class="skeleton"></div>
+    <button id="earlyBtn">Early button (hidden behind overlay soon)</button>
+  </div>
+  <div id="overlay" role="dialog" aria-modal="true" aria-label="Consent">
+    <div id="consentBox">
+      <h2>Consent</h2>
+      <button id="consentAccept">Accept all</button>
+      <button id="consentClose">Dismiss</button>
+    </div>
+  </div>
+  <p id="out"></p>
+  <script>
+    // Simulate hydration: after 700ms the overlay appears and becomes the
+    // active modal; the early button is still in the DOM but occluded.
+    setTimeout(() => {
+      document.getElementById('overlay').classList.add('open');
+      document.getElementById('consentAccept').focus();
+    }, 700);
+    document.getElementById('earlyBtn').addEventListener('click', () => {
+      document.getElementById('out').textContent = 'early clicked';
+    });
+    document.getElementById('consentAccept').addEventListener('click', () => {
+      document.getElementById('overlay').classList.remove('open');
+      document.getElementById('out').textContent = 'consent accepted';
+    });
+    document.getElementById('consentClose').addEventListener('click', () => {
+      document.getElementById('overlay').classList.remove('open');
+    });
+  </script>
+</body>
+</html>

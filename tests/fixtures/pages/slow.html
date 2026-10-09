@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Fixture E — Slow hydration</title></head>
+<body>
+  <h1>Slow page shell</h1>
+  <p>Shell rendered immediately; content hydrates late (slow API).</p>
+  <div id="late-content"></div>
+  <script>
+    // Simulate slow hydration: content arrives 2.5s after load.
+    setTimeout(() => {
+      const d = document.getElementById('late-content');
+      d.innerHTML = '<h2>Hydrated results</h2><button id="lateBtn">Late action</button>';
+    }, 2500);
+  </script>
+</body>
+</html>

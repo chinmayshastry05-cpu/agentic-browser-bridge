@@ -109,3 +109,34 @@ describe('P0-6 generation-aware waits', () => {
     }
   });
 });
+
+describe('slow pages — late hydration (Fixture E)', () => {
+  it('snapshot right after navigate misses late content; browser_wait_for catches up', async () => {
+    const s = await sessionOn('slow.html');
+    try {
+      // Immediately after navigate (domcontentloaded): shell only.
+      const early = await s.snapshot();
+      expect(early.nodes.some((n) => n.name === 'Late action')).toBe(false);
+      // The documented slow-page workflow: wait for the late selector.
+      await s.waitForSelector('#late-content h2', 'visible', 10_000);
+      const late = await s.snapshot();
+      const btn = late.nodes.find((n) => n.name === 'Late action');
+      expect(btn, 'late button appears after hydration').toBeDefined();
+      await s.click(btn!.ref); // must not throw
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('waiting for content that never arrives fails with a clear, actionable error', async () => {
+    const s = await sessionOn('slow.html');
+    try {
+      const err = await s.waitForSelector('#never-appears', 'visible', 1500).catch((e) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect(err.message).toMatch(/waited 1500ms/);
+      expect(err.message).toMatch(/raise timeoutMs/);
+    } finally {
+      await s.close();
+    }
+  });
+});

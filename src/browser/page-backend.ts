@@ -239,7 +239,19 @@ export abstract class PageBackendBase implements BrowserBackend {
   /* ---------------- navigation ---------------- */
 
   async goto(url: string): Promise<void> {
-    await this.requirePage().goto(url, { waitUntil: 'domcontentloaded' });
+    // Explicit navigation budget (Playwright's default is also 30s): a slow
+    // page must fail with an actionable message, not a raw engine timeout.
+    const timeoutMs = 30_000;
+    try {
+      await this.requirePage().goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+    } catch (err) {
+      throw new Error(
+        `navigation to ${url} timed out after ${timeoutMs}ms (page load did not reach ` +
+          `domcontentloaded) — the page or network is very slow. Retry the navigation, or ` +
+          `navigate and then use browser_wait_for for late-loading content. ` +
+          `(${(err as Error).message})`,
+      );
+    }
   }
 
   async goBack(): Promise<void> {
@@ -372,7 +384,18 @@ export abstract class PageBackendBase implements BrowserBackend {
     const { page, frame } = this.frameFor(frameId);
     const scope = frame ?? page;
     const mapped = state === 'visible' ? 'visible' : state === 'hidden' ? 'hidden' : 'attached';
-    await scope.waitForSelector(selector, { state: mapped, timeout: timeoutMs });
+    // locator().waitFor() instead of waitForSelector(): Playwright's locator
+    // engine pierces open shadow roots, so in-shadow selectors from snapshots
+    // resolve here too.
+    try {
+      await scope.locator(selector).first().waitFor({ state: mapped, timeout: timeoutMs });
+    } catch (err) {
+      throw new Error(
+        `waited ${timeoutMs}ms for selector "${selector}" to become ${mapped} — it did not. ` +
+          `On slow pages, raise timeoutMs or wait for a nearer ancestor first. ` +
+          `(${(err as Error).message})`,
+      );
+    }
   }
 
   async pageText(selector?: string, frameId?: string): Promise<string> {

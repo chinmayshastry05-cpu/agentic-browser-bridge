@@ -39,7 +39,9 @@ jobs:
         run: pnpm run build
 
       - name: Install Playwright Chromium (test browsers)
-        run: pnpm exec playwright install chromium --only-shell
+        # Full chromium (not --only-shell): tests/cdp.test.ts spawns the
+        # real chrome binary directly with --remote-debugging-port.
+        run: pnpm exec playwright install chromium
 
       - name: Run test suite
         run: pnpm test

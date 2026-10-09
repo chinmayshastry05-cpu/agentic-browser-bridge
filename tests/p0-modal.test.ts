@@ -180,3 +180,35 @@ describe('P0-1 modal occlusion — hydrated overlay (Fixture B)', () => {
     }
   });
 });
+
+describe('P0-1 modal occlusion — unmarked div overlay (Fixture C)', () => {
+  it('blocks clicks behind a plain-div popup and identifies the occluder', async () => {
+    const s = await sessionOn('div-overlay.html');
+    try {
+      const ref = await refByName(s, 'Background action');
+      const err = await s.click(ref).catch((e) => e);
+      expect(err).toBeInstanceOf(ActionBlockedError);
+      expect(err.detail.hitReason).toBe('occluded');
+      // No dialog markup: the occluder is the plain div, reported as-is.
+      expect(err.detail.occluder?.tag).toBe('div');
+      expect(err.detail.modal).toBeNull();
+      expect(err.message).toMatch(/covers the target/);
+    } finally {
+      await s.close();
+    }
+  });
+
+  it('the dismiss button inside the unmarked popup is actionable; background works after dismiss', async () => {
+    const s = await sessionOn('div-overlay.html');
+    try {
+      const dismissRef = await refByName(s, 'No thanks');
+      await s.click(dismissRef); // must not throw: the button is on top
+      const bgRef = await refByName(s, 'Background action');
+      await s.click(bgRef); // overlay gone: must not throw
+      const text = await s.pageText();
+      expect(text).toContain('background clicked');
+    } finally {
+      await s.close();
+    }
+  });
+});

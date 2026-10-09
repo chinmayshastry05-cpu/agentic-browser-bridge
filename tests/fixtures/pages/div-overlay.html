@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Fixture C — Unmarked div overlay</title>
+<style>
+  #pageBtn { margin: 40px; padding: 12px 24px; }
+  /* Deliberately NO dialog/role/aria-modal markup: a plain fixed div popup,
+     the kind cookie banners and newsletter popups are built from. */
+  #popup {
+    position: fixed; inset: 0; z-index: 9999;
+    background: rgba(0,0,0,0.55);
+    display: flex; align-items: center; justify-content: center;
+  }
+  #popupCard { background: #fff; padding: 32px; border-radius: 8px; }
+  #out { margin: 20px 40px; font-weight: bold; }
+</style>
+</head>
+<body>
+  <h1>Overlay fixture</h1>
+  <button id="pageBtn" onclick="document.getElementById('out').textContent='background clicked'">Background action</button>
+  <p id="out"></p>
+
+  <div id="popup">
+    <div id="popupCard">
+      <h2>Special offer</h2>
+      <p>Subscribe to our newsletter!</p>
+      <button id="dismissBtn">No thanks</button>
+    </div>
+  </div>
+  <script>
+    document.getElementById('dismissBtn').addEventListener('click', () => {
+      document.getElementById('popup').style.display = 'none';
+    });
+  </script>
+</body>
+</html>

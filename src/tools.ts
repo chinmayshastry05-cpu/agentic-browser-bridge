@@ -94,7 +94,8 @@ export function createToolRegistry(session: BrowserSession): Map<string, ToolHan
 
   register(
     'browser_navigate',
-    'Navigate the browser session to a URL (http/https/file/data only).',
+    'Navigate the browser session to a URL (http/https/file/data only). ' +
+      'Refuses with a clear error on login walls: the bridge holds no credentials and never attempts to log in.',
     {
       type: 'object',
       properties: { url: { type: 'string', description: 'URL to navigate to' } },

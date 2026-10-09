@@ -258,4 +258,34 @@ describe.skipIf(!extAvailable)('installed extension smoke (genuine)', () => {
     // And the session gate refuses the click without dismissing the dialog.
     await expect(session.click(bg!.ref)).rejects.toThrow(/blocked/);
   }, 30_000);
+
+  it('shadow DOM: real content script snapshots, clicks and types inside an open shadow root', async () => {
+    // Item 4: document.querySelector(All) cannot cross shadow boundaries, so
+    // the content script needs its own piercing walk (walkDom) and resolver
+    // (deepQuerySelector). This drives the REAL content.js in real Chromium.
+    const shadowUrl = `file://${resolve(HERE, './fixtures/pages/shadow.html')}`;
+    await session.navigate(shadowUrl);
+    const snap = await session.snapshot();
+    const shadowBtn = snap.nodes.find((n) => n.name === 'Shadow greet');
+    const shadowInput = snap.nodes.find((n) => n.name === 'shadow name');
+    expect(shadowBtn, 'shadow button in snapshot').toBeDefined();
+    expect(shadowInput, 'shadow input in snapshot').toBeDefined();
+    // The button has an id, so the selector is the id shortcut — resolved
+    // through the shadow-piercing deepGetElementById (document.querySelector
+    // cannot see it).
+    expect(shadowBtn!.selector).toBe('#shadowBtn');
+    await session.type(shadowInput!.ref, 'Ada');
+    // The typed value reached the shadow field (live read-back).
+    const live = await session.describeLiveTarget(shadowInput!.ref);
+    expect(live?.value).toContain('Ada');
+    await session.click(shadowBtn!.ref);
+    // The shadow button's handler ran (mirrored to document.title; the
+    // shadow <p> itself is invisible to innerText-based pageText).
+    const info = await session.pageInfo();
+    expect(info.title).toContain('shadow hello, Ada');
+    // Light-DOM controls on the same page still work.
+    const lightBtn = snap.nodes.find((n) => n.name === 'Light DOM button');
+    await session.click(lightBtn!.ref);
+    expect(await session.pageText()).toContain('light clicked');
+  }, 30_000);
 });

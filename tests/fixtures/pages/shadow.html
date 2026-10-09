@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Fixture D — Shadow DOM</title></head>
+<body>
+  <h1>Shadow DOM fixture</h1>
+  <button id="lightBtn" onclick="document.getElementById('out').textContent='light clicked'">Light DOM button</button>
+  <p id="out"></p>
+  <my-widget></my-widget>
+  <script>
+    class MyWidget extends HTMLElement {
+      constructor() {
+        super();
+        const root = this.attachShadow({ mode: 'open' });
+        root.innerHTML = `
+          <style>button { padding: 8px 16px; }</style>
+          <div class="card">
+            <p>Shadow content</p>
+            <input id="shadowInput" type="text" placeholder="shadow name">
+            <button id="shadowBtn">Shadow greet</button>
+            <p id="shadowOut"></p>
+          </div>
+        `;
+        const btn = root.getElementById('shadowBtn');
+        const input = root.getElementById('shadowInput');
+        const out = root.getElementById('shadowOut');
+        btn.addEventListener('click', () => {
+          out.textContent = 'shadow hello, ' + input.value;
+          // Also mirror to document.title so tests can observe the click
+          // through public session API (innerText does not pierce shadow DOM).
+          document.title = 'shadow hello, ' + input.value;
+        });
+      }
+    }
+    customElements.define('my-widget', MyWidget);
+  </script>
+</body>
+</html>

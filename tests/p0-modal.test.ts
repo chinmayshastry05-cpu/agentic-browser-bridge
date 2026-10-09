@@ -212,3 +212,27 @@ describe('P0-1 modal occlusion — unmarked div overlay (Fixture C)', () => {
     }
   });
 });
+
+describe('shadow DOM click/type — Playwright backend (Fixture D)', () => {
+  it('clicks and types inside an open shadow root through the session gate', async () => {
+    // snapshot.ts pierces open shadow roots; the occlusion gate must resolve
+    // in-shadow selectors too (page-backend hitTest now uses Playwright's
+    // piercing scope.$ instead of document.querySelector in evaluate()).
+    const s = await sessionOn('shadow.html');
+    try {
+      const inputRef = await refByName(s, 'shadow name');
+      const btnRef = await refByName(s, 'Shadow greet');
+      await s.type(inputRef, 'Ada');
+      // The typed value reached the shadow field (live read-back).
+      const live = await s.describeLiveTarget(inputRef);
+      expect(live?.value).toContain('Ada');
+      await s.click(btnRef);
+      // The shadow button's handler ran (mirrored to document.title; the
+      // shadow <p> itself is invisible to innerText-based pageText).
+      const info = await s.pageInfo();
+      expect(info.title).toContain('shadow hello, Ada');
+    } finally {
+      await s.close();
+    }
+  });
+});

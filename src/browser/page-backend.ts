@@ -593,11 +593,14 @@ export abstract class PageBackendBase implements BrowserBackend {
   ): Promise<import('../types.js').HitTestResult> {
     const { page, frame } = this.frameFor(frameId);
     const scope = frame ?? page;
-    return scope.evaluate(
-      (sel: unknown) => {
-        const selector = sel as string;
-        const el = document.querySelector(selector);
-        if (!el) throw new Error(`no element matches selector "${selector}"`);
+    // Resolve with Playwright's selector engine, which pierces open shadow
+    // roots; document.querySelector inside evaluate() cannot cross shadow
+    // boundaries, so resolving there would silently miss in-shadow targets
+    // (the session's occlusion gate would then degrade to a no-op for them).
+    const handle = await scope.$(selector);
+    if (!handle) throw new Error(`no element matches selector "${selector}"`);
+    try {
+      return (await handle.evaluate((el) => {
         const r = el.getBoundingClientRect();
         const cs = getComputedStyle(el);
         const visible =
@@ -663,6 +666,21 @@ export abstract class PageBackendBase implements BrowserBackend {
           [r.x + inset, r.y + r.height - inset],
           [r.x + r.width - inset, r.y + r.height - inset],
         ];
+        // Shadow-aware hit check: document.elementFromPoint does not pierce
+        // shadow roots — over an in-shadow target it returns the shadow host.
+        // Walk the target's composed ancestors (through shadow hosts) so a
+        // hit on the host counts as a hit on the target.
+        const composedAncestors = (node: Element): Element[] => {
+          const out: Element[] = [];
+          let cur: Element | null = node;
+          while (cur) {
+            out.push(cur);
+            const root = cur.getRootNode();
+            cur = root instanceof ShadowRoot ? (root.host as Element) : cur.parentElement;
+          }
+          return out;
+        };
+        const ancestors = composedAncestors(el);
         let occluder: {
           tag: string;
           role: string;
@@ -674,7 +692,7 @@ export abstract class PageBackendBase implements BrowserBackend {
           const [x, y] = pts[i]!;
           if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) continue;
           const top = document.elementFromPoint(x, y);
-          const hit = !!top && (top === el || el.contains(top));
+          const hit = !!top && (top === el || el.contains(top) || ancestors.includes(top));
           if (i === 0) centerHit = hit;
           if (!hit && !occluder && top) {
             const od = top.closest('dialog, [role="dialog"]');
@@ -691,9 +709,10 @@ export abstract class PageBackendBase implements BrowserBackend {
           };
         }
         return { actionable: true, dialog: dialogInfo(ownDialog), ...base };
-      },
-      selector,
-    ) as Promise<import('../types.js').HitTestResult>;
+      })) as unknown as import('../types.js').HitTestResult;
+    } finally {
+      await handle.dispose().catch(() => undefined);
+    }
   }
 
   async screenshot(path: string): Promise<void> {

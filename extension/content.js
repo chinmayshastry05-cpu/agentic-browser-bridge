@@ -41,15 +41,86 @@
     const stop = document.documentElement;
     while (cur && cur !== stop && parts.length < 8) {
       let part = cur.tagName.toLowerCase();
-      const parent = cur.parentElement;
-      if (parent) {
-        const sibs = Array.from(parent.children).filter((c) => c.tagName === cur.tagName);
+      // parentNode (not parentElement) so in-shadow elements count siblings
+      // inside their shadow root; the shadow host continues the chain.
+      const pn = cur.parentNode;
+      if (pn && pn.children) {
+        const sibs = Array.from(pn.children).filter((c) => c.tagName === cur.tagName);
         if (sibs.length > 1) part += `:nth-of-type(${sibs.indexOf(cur) + 1})`;
       }
       parts.unshift(part);
-      cur = parent;
+      cur = pn instanceof ShadowRoot ? pn.host : cur.parentElement;
     }
     return parts.join(' > ');
+  }
+
+  /**
+   * Shadow-piercing selector resolution. document.querySelector cannot cross
+   * shadow boundaries, but uniqueSelector emits full document-level chains
+   * (e.g. "body > my-el > div > button") for in-shadow elements, so walk the
+   * ">" chain level by level, descending into open shadow roots.
+   * Closed shadow roots are unreachable by design (same as the snapshotter).
+   */
+  function deepQuerySelector(selector) {
+    const parts = selector
+      .split(/\s*>\s*/)
+      .map((p) => p.trim())
+      .filter((p) => p.length > 0);
+    if (parts.length === 1 && parts[0][0] === '#') return deepGetElementById(parts[0].slice(1));
+    const matchPart = (el, part) => {
+      if (part[0] === '#') return el.id === part.slice(1);
+      const m = /^([a-zA-Z][a-zA-Z0-9-]*)(?::nth-of-type\((\d+)\))?$/.exec(part);
+      if (!m) return false;
+      if (el.tagName.toLowerCase() !== m[1].toLowerCase()) return false;
+      if (m[2]) {
+        const pn = el.parentNode;
+        if (!pn || !pn.children) return false;
+        const sibs = Array.from(pn.children).filter((c) => c.tagName === el.tagName);
+        return sibs.indexOf(el) + 1 === Number(m[2]);
+      }
+      return true;
+    };
+    // Children visible to the walk at this level: light-DOM children, plus
+    // open-shadow children of each element (the pierce). Document contributes
+    // <html>'s children since generated selectors are relative to <html>.
+    const childrenOf = (ctx) => {
+      if (ctx instanceof Document) return ctx.documentElement ? Array.from(ctx.documentElement.children) : [];
+      if (ctx instanceof ShadowRoot) return Array.from(ctx.children);
+      const out = Array.from(ctx.children);
+      if (ctx.shadowRoot) out.push(...ctx.shadowRoot.children);
+      return out;
+    };
+    let current = [document];
+    for (const part of parts) {
+      const next = [];
+      for (const ctx of current) {
+        for (const child of childrenOf(ctx)) {
+          if (matchPart(child, part)) next.push(child);
+        }
+      }
+      if (next.length === 0) return null;
+      current = next;
+    }
+    return current[0] || null;
+  }
+
+  function deepGetElementById(id) {
+    let found = null;
+    const visit = (root) => {
+      if (found) return;
+      if (root.getElementById) {
+        const el = root.getElementById(id);
+        if (el) {
+          found = el;
+          return;
+        }
+      }
+      root.querySelectorAll('*').forEach((el) => {
+        if (el.shadowRoot) visit(el.shadowRoot);
+      });
+    };
+    visit(document);
+    return found;
   }
 
   function accessibleName(el) {
@@ -131,11 +202,26 @@
       });
     };
     document.querySelectorAll(`${INTERACTABLE},${STRUCTURAL}`).forEach(push);
+    // Pierce open shadow roots: document.querySelectorAll cannot see inside
+    // them, so collect from each open shadow tree too (recursively).
+    document.querySelectorAll('*').forEach((host) => {
+      const root = host.shadowRoot;
+      if (!root) return;
+      const visit = (r) => {
+        r.querySelectorAll(`${INTERACTABLE},${STRUCTURAL}`).forEach(push);
+        r.querySelectorAll('*').forEach((el) => {
+          if (el.shadowRoot) visit(el.shadowRoot);
+        });
+      };
+      visit(root);
+    });
     return nodes;
   }
 
   function resolve(selector) {
-    const el = document.querySelector(selector);
+    // Shadow-piercing: uniqueSelector emits document-level chains for
+    // in-shadow elements, which document.querySelector cannot resolve.
+    const el = deepQuerySelector(selector);
     if (!el) throw new Error(`no element matches selector "${selector}"`);
     return el;
   }
@@ -259,7 +345,7 @@
           else rejectP(new Error(`waitForSelector timed out: "${selector}" did not become ${st} (${why})`));
         };
         const check = () => {
-          const el = document.querySelector(selector);
+          const el = deepQuerySelector(selector);
           if (st === 'attached') return el ? done(true) : false;
           if (!el) return st === 'hidden' ? done(true) : false;
           const vis = isVisible(el);
@@ -299,7 +385,7 @@
       }));
     },
     describeTarget({ selector }) {
-      const el = document.querySelector(selector);
+      const el = deepQuerySelector(selector);
       return el ? describe(el) : null;
     },
     elementFromPoint({ x, y }) {
@@ -379,11 +465,26 @@
       ];
       let occluder = null;
       let centerHit = false;
+      // Shadow-aware hit check: document.elementFromPoint does not pierce
+      // shadow roots — over an in-shadow target it returns the shadow host.
+      // A hit on the target's composed ancestor chain (through shadow hosts)
+      // counts as a hit on the target.
+      const composedAncestors = (node) => {
+        const out = [];
+        let cur = node;
+        while (cur) {
+          out.push(cur);
+          const root = cur.getRootNode();
+          cur = root instanceof ShadowRoot ? root.host : cur.parentElement;
+        }
+        return out;
+      };
+      const ancestors = composedAncestors(el);
       for (let i = 0; i < pts.length; i++) {
         const [x, y] = pts[i];
         if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) continue;
         const top = document.elementFromPoint(x, y);
-        const hit = !!top && (top === el || el.contains(top));
+        const hit = !!top && (top === el || el.contains(top) || ancestors.includes(top));
         if (i === 0) centerHit = hit;
         if (!hit && !occluder && top) {
           const od = top.closest('dialog, [role="dialog"]');

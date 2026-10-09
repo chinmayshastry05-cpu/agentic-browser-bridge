@@ -30,6 +30,9 @@ beforeAll(async () => {
     } else if (req.url === '/frame.html') {
       res.writeHead(200, { 'content-type': 'text/html' });
       res.end(fixture('frame.html'));
+    } else if (req.url === '/login-wall.html') {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end(fixture('login-wall.html'));
     } else if (req.url === '/download') {
       const body = 'agentic-browser-bridge fixture download\n';
       res.writeHead(200, {
@@ -296,6 +299,18 @@ describe('M2 browser tool surface (real headless Chromium)', () => {
       );
       expect(decision.verdict).toBe('confirm');
       expect(decision.risk).toBe('high');
+    } finally {
+      await session.close();
+    }
+  }, 60_000);
+
+  it('refuses to land on a login wall instead of faking success', async () => {
+    const session = new BrowserSession(`loginwall-${Date.now()}`, new PlaywrightBackend());
+    await session.start({ headless: true });
+    try {
+      await expect(session.navigate(`${baseUrl}/login-wall.html`)).rejects.toThrow(
+        /login wall detected/,
+      );
     } finally {
       await session.close();
     }

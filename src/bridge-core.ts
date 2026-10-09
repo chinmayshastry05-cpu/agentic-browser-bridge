@@ -35,6 +35,7 @@ import {
 import { PlaywrightBackend } from './browser/playwright-backend.js';
 import { CdpBackend } from './browser/cdp-backend.js';
 import { reground, signatureMatches } from './perception/grounding.js';
+import { detectLoginWall } from './security/policy.js';
 import { randomUUID } from 'node:crypto';
 
 /**
@@ -217,7 +218,22 @@ export class BrowserSession {
     }
     await this.backend.goto(url);
     await this.onNavigationCommitted();
-    return { url: this.backend.currentUrl(), title: await this.backend.title() };
+    const finalUrl = this.backend.currentUrl();
+    const title = await this.backend.title();
+    // Login-wall gate (fail-closed): refuse to land on a login wall instead
+    // of letting the agent attempt credentials it does not have, or worse,
+    // pretend it got past one. Both the agent loop and the MCP server route
+    // through here, so one check covers both.
+    const snap = await this.snapshot().catch(() => null);
+    const wall = snap ? detectLoginWall(finalUrl, snap) : null;
+    if (wall) {
+      throw new Error(
+        `login wall detected at ${finalUrl} (${wall}). The bridge holds no credentials ` +
+          `and will not attempt to log in anywhere. Stopping here instead of faking ` +
+          `success — have the operator log in manually if this page is needed.`,
+      );
+    }
+    return { url: finalUrl, title };
   }
 
   async goBack(): Promise<{ url: string }> {

@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { PolicyEngine } from '../src/security/policy.js';
+import { PolicyEngine, detectLoginWall } from '../src/security/policy.js';
 import { ConfirmationQueue, sameAction } from '../src/security/confirm.js';
 import { containsSecret, redactSecrets } from '../src/security/redact.js';
 import { injectionNotice, scanForInjection } from '../src/security/injection.js';
@@ -367,5 +367,65 @@ describe('agent loop injection wiring', () => {
     const userMsg = seen.find((m) => m.role === 'user')!.content;
     expect(userMsg).not.toContain('sk-abc123XYZ789');
     expect(userMsg).toContain('[REDACTED:openai-key]');
+  });
+});
+
+describe('detectLoginWall', () => {
+  let n = 0;
+  function node(over: Partial<DomNode>): DomNode {
+    n += 1;
+    return {
+      ref: `e${n}`,
+      role: 'generic',
+      name: '',
+      tag: 'div',
+      attributes: {},
+      selector: `div:nth-of-type(${n})`,
+      parentRef: null,
+      childrenRefs: [],
+      visible: true,
+      ...over,
+    };
+  }
+  function snap(title: string, nodes: DomNode[]) {
+    return { snapshotId: 's1', url: 'https://x.test/', title, capturedAt: new Date().toISOString(), nodes };
+  }
+
+  it('flags a password field paired with gate text', () => {
+    const s = snap('Sign in', [
+      node({ tag: 'input', role: 'textbox', name: 'Password', attributes: { type: 'password' } }),
+      node({ tag: 'h1', role: 'heading', name: 'Sign in to continue' }),
+    ]);
+    expect(detectLoginWall('https://example.test/', s)).toMatch(/password field/);
+  });
+
+  it('flags a gate phrase on a login path with a sign-in button', () => {
+    const s = snap('Welcome', [
+      node({ tag: 'h1', role: 'heading', name: 'Sign in to continue' }),
+      node({ tag: 'button', role: 'button', name: 'Sign in with Google' }),
+    ]);
+    expect(detectLoginWall('https://example.test/login', s)).toMatch(/gate text/);
+  });
+
+  it('does not flag a lone password field (ordinary form)', () => {
+    const s = snap('Settings', [
+      node({ tag: 'input', role: 'textbox', name: 'New password', attributes: { type: 'password' } }),
+    ]);
+    expect(detectLoginWall('https://example.test/settings', s)).toBeNull();
+  });
+
+  it('does not flag a gate phrase in an article without a sign-in control or login path', () => {
+    const s = snap('Blog', [
+      node({ tag: 'p', role: 'paragraph', text: 'Many sites say "sign in to continue" these days.' }),
+    ]);
+    expect(detectLoginWall('https://example.test/blog/logins', s)).toBeNull();
+  });
+
+  it('ignores hidden password fields', () => {
+    const s = snap('Page', [
+      node({ tag: 'input', role: 'textbox', name: 'pw', attributes: { type: 'password' }, visible: false }),
+      node({ tag: 'h1', role: 'heading', name: 'Sign in to continue' }),
+    ]);
+    expect(detectLoginWall('https://example.test/', s)).toBeNull();
   });
 });

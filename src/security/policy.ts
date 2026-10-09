@@ -23,7 +23,7 @@
  * with status awaiting_confirmation and records a PendingConfirmation that
  * only the operator (CLI/UI) can resolve.
  */
-import type { AgentAction } from '../types.js';
+import type { AgentAction, PageSnapshot } from '../types.js';
 
 export type RiskLevel = 'low' | 'medium' | 'high';
 
@@ -94,6 +94,85 @@ export function consequentialClickKeyword(targetText: string | undefined): strin
     if (re.test(targetText)) return label;
   }
   return undefined;
+}
+
+/**
+ * Login-wall detection (fail-closed).
+ *
+ * A login wall is a page whose purpose is to gate access behind credentials.
+ * The bridge holds no credentials and must never attempt a login or pretend
+ * it got past one, so detection returns a human-readable reason (never a
+ * boolean) and the caller refuses with that reason in the message.
+ *
+ * Signals (deliberately conservative to avoid flagging articles ABOUT logins
+ * or ordinary forms that merely contain a password field):
+ *  1. a VISIBLE password input PLUS a gate phrase or a login URL path — the
+ *     page is asking for credentials in order to proceed;
+ *  2. a gate phrase ("sign in to continue", ...) PLUS a login URL path or a
+ *     visible sign-in button/link (covers OAuth-button walls with no password
+ *     field on the page itself).
+ * A password field alone, a gate phrase alone, or a login URL without gate
+ * text is NOT enough.
+ */
+const LOGIN_PATH_RE =
+  /\/(login|log-in|signin|sign-in|sign_in|auth|authenticate|accounts\/login|users\/sign_in)(\/|$|[?#])/i;
+
+const LOGIN_GATE_PHRASES = [
+  'sign in to continue',
+  'log in to continue',
+  'login to continue',
+  'sign in to view',
+  'log in to view',
+  'sign in to access',
+  'log in to access',
+  'login required',
+  'authentication required',
+  'please log in',
+  'please sign in',
+];
+
+const SIGN_IN_CONTROL_RE = /\b(sign|log)\s?in\b/i;
+
+export function detectLoginWall(url: string, snap: PageSnapshot): string | null {
+  let path = '';
+  try {
+    path = new URL(url).pathname;
+  } catch {
+    // Non-parseable URL: skip the path signal, DOM/text signals still apply.
+  }
+  const hasLoginPath = LOGIN_PATH_RE.test(path);
+
+  let hasPasswordField = false;
+  let hasSignInControl = false;
+  const haystack: string[] = [snap.title ?? ''];
+  for (const n of snap.nodes) {
+    if (!n.visible) continue;
+    if (n.tag === 'input' && (n.attributes['type'] ?? '').toLowerCase() === 'password') {
+      hasPasswordField = true;
+    }
+    if (
+      (n.tag === 'button' || n.tag === 'a' || n.role === 'button' || n.role === 'link') &&
+      SIGN_IN_CONTROL_RE.test(n.name)
+    ) {
+      hasSignInControl = true;
+    }
+    if (n.name) haystack.push(n.name);
+    if (n.text) haystack.push(n.text);
+  }
+  const text = haystack.join(' ').toLowerCase();
+  const gatePhrase = LOGIN_GATE_PHRASES.find((p) => text.includes(p));
+
+  if (hasPasswordField && (gatePhrase || hasLoginPath)) {
+    return (
+      `page contains a password field` +
+      (gatePhrase ? ` with gate text "${gatePhrase}"` : '') +
+      (hasLoginPath ? ` on login path "${path}"` : '')
+    );
+  }
+  if (gatePhrase && (hasLoginPath || hasSignInControl)) {
+    return `gate text "${gatePhrase}"${hasLoginPath ? ` on login path "${path}"` : ' with a sign-in control'}`;
+  }
+  return null;
 }
 
 export class PolicyEngine {

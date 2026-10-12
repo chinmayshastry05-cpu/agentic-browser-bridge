@@ -37,6 +37,23 @@ import { CdpBackend } from './browser/cdp-backend.js';
 import { reground, signatureMatches } from './perception/grounding.js';
 import { detectLoginWall } from './security/policy.js';
 import { randomUUID } from 'node:crypto';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { RefusalError, routesFor, type InputRoute } from './effects.js';
+
+/** A screenshot capture usable ONCE for a raw x/y click (evidence aid, never the driver). */
+export interface VisionCapture {
+  captureId: string;
+  png: Buffer;
+  pngWidth: number;
+  pngHeight: number;
+  viewport: { width: number; height: number };
+  devicePixelRatio: number;
+  /** Screenshot pixels per CSS pixel (pngWidth / viewport.width). */
+  scale: number;
+}
+
 
 /**
  * Thrown by the pre-action occlusion gate when a browser-native hit-test
@@ -505,6 +522,173 @@ export class BrowserSession {
     const t = await this.resolveTarget(ref);
     await this.assertActionable(ref, t.selector, t.frameId);
     await this.backend.click(t.selector, t.frameId);
+  }
+
+  /** Click via an explicit input route. trusted_input = real input events; dom_event = synthetic DOM click. */
+  async clickVia(ref: string, route: InputRoute): Promise<void> {
+    if (route === 'trusted_input') return this.click(ref);
+    if (!this.backend.clickDom) {
+      throw new RefusalError(
+        {
+          code: 'unsupported_route',
+          message: `backend "${this.backend.backendName}" cannot deliver clicks as dom_event`,
+          hint: 'Omit input_route to use the backend default.',
+        },
+        { target: 'different_route', reason: 'dom_event not available on this backend' },
+      );
+    }
+    const t = await this.resolveTarget(ref);
+    await this.assertActionable(ref, t.selector, t.frameId);
+    await this.backend.clickDom(t.selector, t.frameId);
+  }
+
+  /** Bring the active tab to the front (delivery_mode=foreground). */
+  async bringToFront(): Promise<void> {
+    if (!this.backend.bringToFront) {
+      throw new RefusalError(
+        {
+          code: 'unsupported_delivery',
+          message: `backend "${this.backend.backendName}" cannot bring the tab to the foreground`,
+          hint: 'Use delivery_mode "background" (the default).',
+        },
+        { target: 'different_backend', reason: 'foreground delivery not available on this backend' },
+      );
+    }
+    await this.backend.bringToFront();
+  }
+
+  /** Input routes this session's backend can deliver. */
+  inputRoutes(): { routes: InputRoute[]; default: InputRoute } {
+    return routesFor(this.backend.backendName);
+  }
+
+  private captures = new Map<string, { identity: PageIdentity; used: boolean }>();
+
+  /**
+   * Take a screenshot as VERIFICATION EVIDENCE. Registers a one-use capture id
+   * bound to the current page identity. The DOM/accessibility tree remains
+   * the primary way to see and act; this never replaces it.
+   */
+  async captureVision(): Promise<VisionCapture> {
+    const dir = await mkdtemp(join(tmpdir(), 'abb-capture-'));
+    try {
+      const path = join(dir, 'capture.png');
+      await this.screenshot(path);
+      const png = await readFile(path);
+      const pngWidth = png.length > 24 ? png.readUInt32BE(16) : 0;
+      const pngHeight = png.length > 24 ? png.readUInt32BE(20) : 0;
+      const vp = this.backend.viewportInfo
+        ? await this.backend.viewportInfo().catch(() => null)
+        : null;
+      const viewport = vp ? { width: vp.width, height: vp.height } : { width: pngWidth, height: pngHeight };
+      const devicePixelRatio = vp?.devicePixelRatio ?? 1;
+      const scale = viewport.width > 0 ? pngWidth / viewport.width : 1;
+      const captureId = `cap-${randomUUID().slice(0, 12)}`;
+      this.captures.set(captureId, { identity: this.pageIdentity(), used: false });
+      while (this.captures.size > 8) {
+        const first = this.captures.keys().next().value;
+        if (first === undefined) break;
+        this.captures.delete(first);
+      }
+      return { captureId, png, pngWidth, pngHeight, viewport, devicePixelRatio, scale };
+    } finally {
+      await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  private requireLiveCapture(captureId: string): { identity: PageIdentity; used: boolean } {
+    const c = this.captures.get(captureId);
+    if (!c) {
+      throw new RefusalError(
+        {
+          code: 'unknown_capture',
+          message: `unknown capture_id "${captureId}"`,
+          hint: 'Take browser_snapshot with include_screenshot=true and use the capture_id it returns.',
+        },
+        { target: 'fresh_snapshot', reason: 'capture id was never issued or has been evicted' },
+      );
+    }
+    const now = this.pageIdentity();
+    const stale =
+      c.used ||
+      now.navGeneration !== c.identity.navGeneration ||
+      now.pageNonce !== c.identity.pageNonce ||
+      now.url !== c.identity.url;
+    if (stale) {
+      throw new RefusalError(
+        {
+          code: 'stale_capture',
+          message: c.used
+            ? `capture_id "${captureId}" was already used (captures are one-use)`
+            : `capture_id "${captureId}" is stale: the page navigated since the screenshot`,
+          hint: 'Take a fresh browser_snapshot with include_screenshot=true and use the new capture_id.',
+        },
+        { target: 'fresh_snapshot', reason: 'the screenshot no longer matches the live page' },
+      );
+    }
+    return c;
+  }
+
+  /** Convert capture pixel coordinates to CSS pixels, validating bounds. Does not consume the capture. */
+  resolveCapturePoint(captureId: string, x: number, y: number, scale: number, viewport: { width: number; height: number }): { cssX: number; cssY: number } {
+    this.requireLiveCapture(captureId);
+    const cssX = x / scale;
+    const cssY = y / scale;
+    if (!(cssX >= 0 && cssY >= 0 && cssX <= viewport.width && cssY <= viewport.height)) {
+      throw new RefusalError(
+        {
+          code: 'out_of_bounds',
+          message: `point (${x}, ${y}) is outside the captured viewport`,
+          hint: 'Use coordinates inside the screenshot image.',
+        },
+        { target: 'fresh_snapshot', reason: 'coordinates outside the capture' },
+      );
+    }
+    return { cssX, cssY };
+  }
+
+  private captureMeta = new Map<string, { scale: number; viewport: { width: number; height: number } }>();
+  rememberCaptureMeta(captureId: string, scale: number, viewport: { width: number; height: number }): void {
+    this.captureMeta.set(captureId, { scale, viewport });
+    while (this.captureMeta.size > 8) {
+      const first = this.captureMeta.keys().next().value;
+      if (first === undefined) break;
+      this.captureMeta.delete(first);
+    }
+  }
+
+  /** CSS point for a capture click (validates, does not consume). Used for policy checks. */
+  capturePointToCss(captureId: string, x: number, y: number): { cssX: number; cssY: number } {
+    const meta = this.captureMeta.get(captureId);
+    if (!meta) this.requireLiveCapture(captureId); // throws unknown_capture
+    const m = meta ?? { scale: 1, viewport: { width: Infinity, height: Infinity } };
+    return this.resolveCapturePoint(captureId, x, y, m.scale, m.viewport);
+  }
+
+  /** Describe the element under a capture point, for the policy layer. */
+  async describeCapturePoint(captureId: string, x: number, y: number): Promise<{ tag: string; role: string; name: string } | null> {
+    if (!this.backend.describePoint) return null;
+    const { cssX, cssY } = this.capturePointToCss(captureId, x, y);
+    return this.backend.describePoint(cssX, cssY).catch(() => null);
+  }
+
+  /** One-use raw coordinate click bound to a capture. Refuses stale/used/unknown captures. */
+  async clickAtCapture(captureId: string, x: number, y: number): Promise<{ cssX: number; cssY: number }> {
+    if (!this.backend.clickAt) {
+      throw new RefusalError(
+        {
+          code: 'unsupported_backend',
+          message: `backend "${this.backend.backendName}" does not support raw coordinate clicks`,
+          hint: 'Use browser_click with an element ref from browser_snapshot.',
+        },
+        { target: 'different_backend', reason: 'coordinate clicks need a trusted-input backend' },
+      );
+    }
+    const { cssX, cssY } = this.capturePointToCss(captureId, x, y);
+    const c = this.requireLiveCapture(captureId);
+    c.used = true; // one-use: consumed even if the click fails
+    await this.backend.clickAt(cssX, cssY);
+    return { cssX, cssY };
   }
 
   async dblclick(ref: string): Promise<void> {

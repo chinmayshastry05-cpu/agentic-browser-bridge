@@ -356,7 +356,7 @@ describe('MCP OAuth 2.0 (ChatGPT-compatible, real protocol)', () => {
     ).result.tools;
     const expected = listToolDefinitions(createToolRegistry(session)).map((d) => d.name).sort();
     expect(listed.map((t) => t.name).sort()).toEqual(expected);
-    expect(listed).toHaveLength(30);
+    expect(listed).toHaveLength(32);
     // Annotations are present and honest.
     const snap = listed.find((t) => t.name === 'browser_snapshot')!;
     expect(snap.annotations?.['readOnlyHint']).toBe(true);

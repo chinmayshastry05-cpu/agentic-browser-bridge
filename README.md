@@ -40,6 +40,8 @@ An agent can't click what it can't see. This bridge gives it eyes and hands:
   arguments, the page/snapshot state, and the requesting session, expires
   after 10 minutes, and is consumed by the retry it unblocks.
 
+See [docs/ACTION_CONTRACT.md](docs/ACTION_CONTRACT.md) for effect codes, the refusal envelope, `browser_verify`, and screenshot capture evidence.
+
 ## Architecture
 
 ```

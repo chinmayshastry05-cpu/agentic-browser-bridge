@@ -95,6 +95,10 @@ export interface AgentAction {
 
 /** Outcome of verifying an action's effect on the page. */
 export interface ActionVerification {
+  /** Structured effect code derived from this check (see effects.ts). */
+  effect?: import('./effects.js').EffectCode;
+  /** What readback backs a confirmed effect. */
+  evidence?: import('./effects.js').EvidenceKind;
   verified: boolean;
   /** How verification was performed, e.g. "url-match", "field-value". */
   method: string;
@@ -207,6 +211,20 @@ export interface BrowserBackend {
   /** Wait for the next download to complete. Throws on timeout. */
   waitForDownload(timeoutMs: number): Promise<DownloadRecord>;
   screenshot(path: string): Promise<void>;
+  /**
+   * Optional vision-evidence helpers. Used ONLY as a verification/evidence
+   * aid (snapshot include_screenshot + one-use capture_id raw clicks); the
+   * DOM/accessibility tree stays the primary way to see and act.
+   */
+  viewportInfo?(): Promise<{ width: number; height: number; devicePixelRatio: number }>;
+  /** Raw CSS-pixel click (trusted input). */
+  clickAt?(x: number, y: number): Promise<void>;
+  /** Describe the element under a CSS-pixel point (for policy checks). */
+  describePoint?(x: number, y: number): Promise<{ tag: string; role: string; name: string } | null>;
+  /** Dispatch a DOM click event without trusted input. */
+  clickDom?(selector: string, frameId?: string): Promise<void>;
+  /** Bring the active tab to the front (foreground delivery). */
+  bringToFront?(): Promise<void>;
   currentUrl(): string;
   title(): Promise<string>;
   /**

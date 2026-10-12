@@ -950,4 +950,4 @@ export async function startMcpServer(
       oauth.revokeAll(); // wipe every OAuth store on stop
     },
   };
-                              }
+}

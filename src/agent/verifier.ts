@@ -43,6 +43,7 @@ export async function verifyAction(
   preUrl: string,
 ): Promise<ActionVerification> {
   const unverified = (method: string, detail: string): ActionVerification => ({
+    effect: method === 'dom-diff' ? 'suspected_noop' : 'unverifiable',
     verified: false,
     method,
     detail,
@@ -53,6 +54,8 @@ export async function verifyAction(
       const postUrl = session.url;
       const ok = normalizeUrl(postUrl) === normalizeUrl(action.url ?? '');
       return {
+        effect: ok ? 'confirmed' : 'partial',
+        ...(ok ? { evidence: 'window_change' as const } : {}),
         verified: ok,
         method: 'url-match',
         detail: ok
@@ -66,6 +69,8 @@ export async function verifyAction(
     case 'reload': {
       const changed = session.url !== preUrl;
       return {
+        effect: changed ? 'confirmed' : 'suspected_noop',
+        ...(changed ? { evidence: 'window_change' as const } : {}),
         verified: changed,
         method: 'url-changed',
         detail: changed ? `URL changed to ${session.url}` : 'URL unchanged after navigation action',
@@ -75,12 +80,24 @@ export async function verifyAction(
     case 'click':
     case 'double_click': {
       if (session.url !== preUrl) {
-        return { verified: true, method: 'url-changed', detail: `navigated to ${session.url}` };
+        return {
+          effect: 'confirmed',
+          evidence: 'window_change',
+          verified: true,
+          method: 'url-changed',
+          detail: `navigated to ${session.url}`,
+        };
       }
       // Re-observe: if the DOM changed observably, the click had an effect.
       const post = await session.snapshot().catch(() => null);
       if (post && post.url !== preUrl) {
-        return { verified: true, method: 'url-changed', detail: `navigated to ${post.url}` };
+        return {
+          effect: 'confirmed',
+          evidence: 'window_change',
+          verified: true,
+          method: 'url-changed',
+          detail: `navigated to ${post.url}`,
+        };
       }
       return unverified(
         'dom-diff',
@@ -92,7 +109,12 @@ export async function verifyAction(
       const live = action.ref ? await describeRef(session, action.ref) : null;
       const expected = action.text ?? '';
       const ok = !!live && (live.value ?? '').includes(expected);
+      const got = live?.value ?? '';
+      // Field holds a non-empty strict prefix of what we typed: truncated (maxlength etc).
+      const truncated = !ok && got.length > 0 && expected.length > got.length && expected.startsWith(got);
       return {
+        effect: ok ? 'confirmed' : truncated ? 'partial' : 'suspected_noop',
+        ...(ok ? { evidence: 'value_readback' as const } : {}),
         verified: ok,
         method: 'field-value',
         detail: ok
@@ -105,6 +127,8 @@ export async function verifyAction(
       const live = action.ref ? await describeRef(session, action.ref) : null;
       const ok = !!live && (live.value ?? '') === '';
       return {
+        effect: ok ? 'confirmed' : 'suspected_noop',
+        ...(ok ? { evidence: 'value_readback' as const } : {}),
         verified: ok,
         method: 'field-value',
         detail: ok ? 'field is empty' : `field value is "${(live?.value ?? '').slice(0, 80)}"`,
@@ -115,6 +139,8 @@ export async function verifyAction(
       const live = action.ref ? await describeRef(session, action.ref) : null;
       const ok = !!live && (action.values ?? []).includes(live.value ?? '');
       return {
+        effect: ok ? 'confirmed' : 'suspected_noop',
+        ...(ok ? { evidence: 'value_readback' as const } : {}),
         verified: ok,
         method: 'field-value',
         detail: ok
@@ -127,6 +153,8 @@ export async function verifyAction(
       const live = action.ref ? await describeRef(session, action.ref) : null;
       const ok = !!live && live.checked === action.checked;
       return {
+        effect: ok ? 'confirmed' : 'suspected_noop',
+        ...(ok ? { evidence: 'value_readback' as const } : {}),
         verified: ok,
         method: 'checked-state',
         detail: ok

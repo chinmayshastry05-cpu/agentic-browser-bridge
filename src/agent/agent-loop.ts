@@ -19,6 +19,7 @@
 import { analyze } from '../analyzer.js';
 import { buildTree, renderTree } from '../tree.js';
 import { verifyAction } from './verifier.js';
+import { RefusalError } from '../effects.js';
 import { TaskStore } from '../state/task-store.js';
 import { redactSecrets } from '../security/redact.js';
 import { injectionNotice, scanForInjection } from '../security/injection.js';
@@ -35,7 +36,7 @@ import type {
   StepRecord,
   ToolResult,
 } from '../types.js';
-import { BrowserSession } from '../bridge-core.js';
+import { BrowserSession, ActionBlockedError } from '../bridge-core.js';
 
 export interface AgentLoopOptions {
   maxSteps?: number;
@@ -305,7 +306,9 @@ export class AgentLoop {
         break;
       } catch (err) {
         lastError = (err as Error).message;
-        const kind = classifyFailure(lastError);
+        // Refusals (blocked by modal, structured refusals) are never auto-retried.
+        const refused = err instanceof ActionBlockedError || err instanceof RefusalError;
+        const kind = refused ? 'fatal' : classifyFailure(lastError);
         if (attempt === 1 || kind === 'fatal') {
           // No more retries: one retry already used, or not retryable.
           recoveryAttempts = attempt;

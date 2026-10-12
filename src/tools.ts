@@ -15,6 +15,19 @@ import { buildTree, dialogSubtreeNodes, regionNodes, renderTree } from './tree.j
 import { analyze } from './analyzer.js';
 import { verifyAction } from './agent/verifier.js';
 import type { AgentAction, McpToolDefinition, ToolResult } from './types.js';
+import {
+  RefusalError,
+  parseDelivery,
+  parseRoute,
+  refusalFromError,
+  refusedData,
+  validateActionResult,
+  type DeliveryMode,
+  type EffectCode,
+  type EvidenceKind,
+  type InputRoute,
+} from './effects.js';
+import { runVerify, parsePredicates } from './verify-tool.js';
 
 export interface ToolHandler {
   definition: McpToolDefinition;
@@ -46,18 +59,39 @@ export function createToolRegistry(session: BrowserSession): Map<string, ToolHan
           return await handle(args);
         } catch (err) {
           if (err instanceof ActionBlockedError) {
-            // Structured blocked result: the agent must see WHAT blocks it
-            // (active modal) instead of a bare error string.
+            // Structured refusal: the agent must see WHAT blocks it (active
+            // modal) instead of a bare error string. Legacy fields stay.
             return {
               ok: false,
               error: err.message,
-              data: {
-                blocked: true,
-                reason: err.reason,
-                modal: err.detail.modal,
-                occluder: err.detail.occluder,
-                suggestedNextStep: err.detail.suggestedNextStep,
-              },
+              data: refusedData(
+                {
+                  code: 'blocked_by_modal',
+                  message: err.message,
+                  hint: err.detail.suggestedNextStep,
+                },
+                {
+                  target: 'user',
+                  reason: 'a modal/dialog or overlay owns the page; dismissing it is an explicit, separate step',
+                },
+                {
+                  blocked: true,
+                  reason: err.reason,
+                  modal: err.detail.modal,
+                  occluder: err.detail.occluder,
+                  suggestedNextStep: err.detail.suggestedNextStep,
+                },
+              ),
+            };
+          }
+          const refusal = refusalFromError(err);
+          if (refusal) {
+            return {
+              ok: false,
+              error: refusal.refusal.message,
+              data: refusedData(refusal.refusal, refusal.escalation, {
+                suggestedNextStep: refusal.refusal.hint,
+              }),
             };
           }
           return { ok: false, error: (err as Error).message };
@@ -77,6 +111,7 @@ export function createToolRegistry(session: BrowserSession): Map<string, ToolHan
     action: AgentAction,
     preUrl: string,
     run: () => Promise<Record<string, unknown>>,
+    meta: { route?: InputRoute; delivery?: DeliveryMode; noopIsUnverifiable?: boolean } = {},
   ): Promise<ToolResult> => {
     const data = await run();
     let verification;
@@ -89,7 +124,64 @@ export function createToolRegistry(session: BrowserSession): Map<string, ToolHan
         detail: `verification errored: ${(err as Error).message}`,
       };
     }
-    return { ok: true, data: { ...data, accepted: true, verification } };
+    let effect: EffectCode = verification.effect ?? (verification.verified ? 'unverifiable' : 'unverifiable');
+    let evidence: EvidenceKind | undefined = verification.evidence;
+    // A raw coordinate click carries no element to read back: no change is not proof of a no-op.
+    if (meta.noopIsUnverifiable && effect === 'suspected_noop') effect = 'unverifiable';
+    if (effect === 'confirmed' && !evidence) effect = 'unverifiable';
+    if (effect !== 'confirmed') evidence = undefined;
+    const env: Record<string, unknown> = { effect };
+    if (evidence) env['evidence'] = evidence;
+    if (meta.route) env['route'] = meta.route;
+    if (meta.delivery) env['delivery'] = meta.delivery;
+    const violations = validateActionResult(env as never);
+    if (violations.length > 0) {
+      env['effect'] = 'unverifiable';
+      delete env['evidence'];
+      verification = { ...verification, detail: `${verification.detail} [envelope invariant: ${violations.join('; ')}]` };
+    }
+    return { ok: true, data: { ...data, ...env, accepted: true, verification } };
+  };
+
+  /**
+   * Parse delivery_mode / input_route for an input tool, refuse (never
+   * silently downgrade) when the backend cannot honor them, and apply
+   * foreground delivery. dom_event is only offered where the backend has it.
+   */
+  const prepareInput = async (
+    args: Record<string, unknown>,
+    opts: { allowDomEvent: boolean },
+  ): Promise<{ route: InputRoute; delivery: DeliveryMode }> => {
+    const requested = parseRoute(args['input_route']);
+    const delivery = parseDelivery(args['delivery_mode']);
+    const caps = session.inputRoutes();
+    const route: InputRoute = requested === 'auto' ? caps.default : requested;
+    const supported = caps.routes.includes(route) && (route !== 'dom_event' || caps.default === 'dom_event' || opts.allowDomEvent);
+    if (!supported) {
+      throw new RefusalError(
+        {
+          code: 'unsupported_route',
+          message: `input_route "${route}" is not available for this action on backend "${session.backendName}"`,
+          hint: `Available here: ${caps.routes.join(', ')}. Omit input_route to use "${caps.default}".`,
+        },
+        { target: 'different_route', reason: 'requested input route not deliverable' },
+      );
+    }
+    if (delivery === 'foreground') await session.bringToFront();
+    return { route, delivery };
+  };
+
+  const ROUTE_PROPS = {
+    delivery_mode: {
+      type: 'string',
+      description:
+        '"background" (default: act without bringing the tab to the front) or "foreground" (bring the tab to the front first). Refused if unsupported.',
+    },
+    input_route: {
+      type: 'string',
+      description:
+        '"auto" (default), "trusted" (real input events) or "dom_event" (synthetic DOM click; click only). Refused if the backend cannot deliver it.',
+    },
   };
 
   register(
@@ -139,6 +231,11 @@ export function createToolRegistry(session: BrowserSession): Map<string, ToolHan
           type: 'number',
           description: 'Maximum rendered nodes (default 120)',
         },
+        include_screenshot: {
+          type: 'boolean',
+          description:
+            'Also capture a PNG as verification EVIDENCE (with scale metadata and a one-use capture_id for browser_click_at). The element tree stays the primary way to see and act.',
+        },
       },
     },
     async (args) => {
@@ -173,6 +270,24 @@ export function createToolRegistry(session: BrowserSession): Map<string, ToolHan
           ? Math.min(Math.floor(args['maxNodes'] as number), 2000)
           : 120;
       const tree = renderTree(buildTree(nodes), 6, maxNodes, { prioritize: true });
+      let screenshot: Record<string, unknown> | undefined;
+      if (args['include_screenshot'] === true) {
+        const cap = await session.captureVision();
+        session.rememberCaptureMeta(cap.captureId, cap.scale, cap.viewport);
+        screenshot = {
+          capture_id: cap.captureId,
+          mime_type: 'image/png',
+          encoding: 'base64',
+          width: cap.pngWidth,
+          height: cap.pngHeight,
+          viewport: cap.viewport,
+          device_pixel_ratio: cap.devicePixelRatio,
+          scale: cap.scale,
+          coordinate_note:
+            'x/y for browser_click_at are screenshot pixels; css = pixel / scale. Evidence aid only: prefer element refs.',
+          data: cap.png.toString('base64'),
+        };
+      }
       return {
         ok: true,
         data: {
@@ -184,6 +299,7 @@ export function createToolRegistry(session: BrowserSession): Map<string, ToolHan
           nodeCount: nodes.length,
           scope: scopeNote || 'full-page',
           tree,
+          ...(screenshot ? { screenshot } : {}),
         },
       };
     },
@@ -196,16 +312,22 @@ export function createToolRegistry(session: BrowserSession): Map<string, ToolHan
       '(an observable page effect was seen) — accepted without verified is NOT success.',
     {
       type: 'object',
-      properties: { ref: { type: 'string', description: 'Element ref, e.g. "e3"' } },
+      properties: { ref: { type: 'string', description: 'Element ref, e.g. "e3"' }, ...ROUTE_PROPS },
       required: ['ref'],
     },
     async (args) => {
       const ref = str(args, 'ref');
+      const meta = await prepareInput(args, { allowDomEvent: true });
       const preUrl = session.url;
-      return withVerification({ action: 'click', ref }, preUrl, async () => {
-        await session.click(ref);
-        return { clicked: ref };
-      });
+      return withVerification(
+        { action: 'click', ref },
+        preUrl,
+        async () => {
+          await session.clickVia(ref, meta.route);
+          return { clicked: ref };
+        },
+        meta,
+      );
     },
   );
 
@@ -219,6 +341,7 @@ export function createToolRegistry(session: BrowserSession): Map<string, ToolHan
         ref: { type: 'string', description: 'Element ref, e.g. "e5"' },
         text: { type: 'string', description: 'Text to type' },
         submit: { type: 'boolean', description: 'Press Enter after typing' },
+        ...ROUTE_PROPS,
       },
       required: ['ref', 'text'],
     },
@@ -226,11 +349,102 @@ export function createToolRegistry(session: BrowserSession): Map<string, ToolHan
       const ref = str(args, 'ref');
       const text = str(args, 'text');
       const submit = args['submit'] === true;
+      const meta = await prepareInput(args, { allowDomEvent: false });
       const preUrl = session.url;
-      return withVerification({ action: 'type', ref, text, submit }, preUrl, async () => {
-        await session.type(ref, text, submit);
-        return { typedInto: ref };
-      });
+      return withVerification(
+        { action: 'type', ref, text, submit },
+        preUrl,
+        async () => {
+          await session.type(ref, text, submit);
+          return { typedInto: ref };
+        },
+        meta,
+      );
+    },
+  );
+
+  register(
+    'browser_verify',
+    'Check agent-declared postconditions against live page state. Predicates (1-8): ' +
+      '{kind:"url", equals|contains|matches}, {kind:"title", equals|contains}, ' +
+      '{kind:"element", ref, role?, name?, name_contains?, value?, value_contains?, checked?, visible?}. ' +
+      'Polls every 100ms up to timeout_ms (default 5000, max 10000); "satisfied" needs 2 consecutive passing samples. ' +
+      'Result: satisfied | unsatisfied | unknown (with per-predicate unknown_reason). ' +
+      'Absence (exists:false) is rejected - it cannot be proven from a ref.',
+    {
+      type: 'object',
+      properties: {
+        predicates: {
+          type: 'array',
+          description: '1-8 predicate objects',
+          items: {
+            type: 'object',
+            properties: {
+              kind: { type: 'string', description: '"url", "title" or "element"' },
+              ref: { type: 'string' },
+              equals: { type: 'string' },
+              contains: { type: 'string' },
+              matches: { type: 'string', description: 'Regular expression (url only)' },
+              role: { type: 'string' },
+              name: { type: 'string' },
+              name_contains: { type: 'string' },
+              value: { type: 'string' },
+              value_contains: { type: 'string' },
+              checked: { type: 'boolean' },
+              visible: { type: 'boolean' },
+              exists: { type: 'boolean', description: 'Only true is accepted' },
+            },
+            required: ['kind'],
+          },
+        },
+        timeout_ms: { type: 'number', description: 'Max polling time in ms (default 5000, max 10000)' },
+      },
+      required: ['predicates'],
+    },
+    async (args) => {
+      const preds = parsePredicates(args['predicates']);
+      const timeout =
+        typeof args['timeout_ms'] === 'number' && (args['timeout_ms'] as number) > 0
+          ? Math.min(args['timeout_ms'] as number, 10_000)
+          : 5_000;
+      const r = await runVerify(session, preds, timeout);
+      return { ok: true, data: r as unknown as Record<string, unknown> };
+    },
+  );
+
+  register(
+    'browser_click_at',
+    'Raw coordinate click bound to a screenshot capture (one-use capture_id from browser_snapshot include_screenshot). ' +
+      'x/y are screenshot pixels. Refused when the capture is stale (page navigated), already used, or unknown. ' +
+      'Last resort: prefer browser_click with an element ref.',
+    {
+      type: 'object',
+      properties: {
+        capture_id: { type: 'string', description: 'capture_id from browser_snapshot include_screenshot=true' },
+        x: { type: 'number', description: 'X in screenshot pixels' },
+        y: { type: 'number', description: 'Y in screenshot pixels' },
+        delivery_mode: ROUTE_PROPS.delivery_mode,
+      },
+      required: ['capture_id', 'x', 'y'],
+    },
+    async (args) => {
+      const captureId = str(args, 'capture_id');
+      const x = args['x'];
+      const y = args['y'];
+      if (typeof x !== 'number' || typeof y !== 'number') throw new Error('"x" and "y" must be numbers');
+      const delivery = parseDelivery(args['delivery_mode']);
+      session.capturePointToCss(captureId, x, y); // refuse early, before foregrounding
+      if (delivery === 'foreground') await session.bringToFront();
+      const preUrl = session.url;
+      return withVerification(
+        { action: 'click' },
+        preUrl,
+        async () => {
+          const p = await session.clickAtCapture(captureId, x, y);
+          return { clickedAt: { x, y, cssX: p.cssX, cssY: p.cssY } };
+        },
+        { route: 'trusted_input', delivery, noopIsUnverifiable: true },
+      );
     },
   );
 
@@ -664,4 +878,4 @@ export function listToolDefinitions(
   registry: Map<string, ToolHandler>,
 ): McpToolDefinition[] {
   return [...registry.values()].map((h) => h.definition);
-}
+                              }

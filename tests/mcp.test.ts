@@ -110,6 +110,7 @@ describe('mcp tools', () => {
       'browser_check',
       'browser_clear',
       'browser_click',
+      'browser_click_at',
       'browser_close_tab',
       'browser_double_click',
       'browser_downloads',
@@ -134,6 +135,7 @@ describe('mcp tools', () => {
       'browser_tabs',
       'browser_type',
       'browser_upload',
+      'browser_verify',
       'browser_wait_for',
       'browser_wait_for_download',
     ]);

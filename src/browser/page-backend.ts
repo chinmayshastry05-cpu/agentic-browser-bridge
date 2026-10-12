@@ -326,6 +326,48 @@ export abstract class PageBackendBase implements BrowserBackend {
     await locator.dblclick({ timeout: CLICK_TIMEOUT });
   }
 
+  /* ---------------- vision-evidence helpers (verification aid only) ---------------- */
+
+  async viewportInfo(): Promise<{ width: number; height: number; devicePixelRatio: number }> {
+    const page = this.requirePage();
+    return page.evaluate(() => ({
+      width: window.innerWidth,
+      height: window.innerHeight,
+      devicePixelRatio: window.devicePixelRatio || 1,
+    }));
+  }
+
+  async clickAt(x: number, y: number): Promise<void> {
+    await this.requirePage().mouse.click(x, y);
+  }
+
+  async describePoint(x: number, y: number): Promise<{ tag: string; role: string; name: string } | null> {
+    const page = this.requirePage();
+    return page.evaluate(
+      ([px, py]) => {
+        const el = document.elementFromPoint(px as number, py as number);
+        if (!el) return null;
+        const name =
+          el.getAttribute('aria-label') ||
+          (el as HTMLElement).innerText?.trim().slice(0, 120) ||
+          el.getAttribute('title') ||
+          el.getAttribute('value') ||
+          '';
+        return { tag: el.tagName.toLowerCase(), role: el.getAttribute('role') || '', name };
+      },
+      [x, y] as [number, number],
+    );
+  }
+
+  async clickDom(selector: string, frameId?: string): Promise<void> {
+    const { locator } = this.locatorTarget(selector, frameId);
+    await locator.dispatchEvent('click', undefined, { timeout: CLICK_TIMEOUT });
+  }
+
+  async bringToFront(): Promise<void> {
+    await this.requirePage().bringToFront();
+  }
+
   async type(selector: string, text: string, submit: boolean, frameId?: string): Promise<void> {
     const { page, locator } = this.locatorTarget(selector, frameId);
     await locator.scrollIntoViewIfNeeded().catch(() => undefined);

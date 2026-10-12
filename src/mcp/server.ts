@@ -79,6 +79,10 @@ function toolToAction(name: string, args: Record<string, unknown>): AgentAction 
       return { action: 'reload' };
     case 'browser_click':
       return { action: 'click', ref };
+    case 'browser_click_at':
+      // Raw coordinate click: classified as a click (no ref); the element
+      // under the point is resolved below so consequential-click keywords still apply.
+      return { action: 'click' };
     case 'browser_double_click':
       return { action: 'double_click', ref };
     case 'browser_type': {
@@ -147,7 +151,8 @@ export function jsonSchemaToZod(schema: Record<string, unknown>): z.ZodTypeAny {
       const field = jsonSchemaToZod(v);
       shape[k] = required.has(k) ? field : field.optional();
     }
-    base = z.object(shape);
+    // Closed schema: unknown arguments are rejected instead of silently dropped.
+    base = z.object(shape).strict();
   } else {
     base = z.unknown();
   }
@@ -213,6 +218,7 @@ const TOOL_ANNOTATIONS: Record<
   browser_status: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
   browser_downloads: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
   browser_wait_for_download: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+  browser_verify: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
   // Reversible, idempotent state changes (no data loss, safe to repeat).
   browser_hover: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
   browser_focus: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
@@ -223,6 +229,7 @@ const TOOL_ANNOTATIONS: Record<
   browser_forward: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
   browser_reload: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
   browser_click: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+  browser_click_at: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
   browser_double_click: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
   browser_type: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
   browser_clear: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
@@ -239,6 +246,59 @@ const TOOL_ANNOTATIONS: Record<
 };
 
 /** Conservative fallback for any tool missing from the map above. */
+const ACTION_TOOLS = new Set([
+  'browser_navigate',
+  'browser_back',
+  'browser_forward',
+  'browser_reload',
+  'browser_click',
+  'browser_double_click',
+  'browser_click_at',
+  'browser_type',
+  'browser_clear',
+  'browser_press_key',
+  'browser_select_option',
+  'browser_check',
+  'browser_scroll',
+]);
+
+const refusalShape = z.object({ code: z.string(), message: z.string(), hint: z.string() });
+const escalationShape = z.object({ target: z.string(), reason: z.string() });
+
+/**
+ * Per-tool outputSchema. Every tool returns {ok, data?, error?}. Mutating
+ * action tools additionally declare the effect envelope (effect code,
+ * route, delivery, evidence) and the refusal shape, so clients can rely on it.
+ */
+export function outputSchemaFor(name: string): z.ZodTypeAny {
+  const common = { ok: z.boolean(), error: z.string().optional() };
+  if (ACTION_TOOLS.has(name)) {
+    const data = z
+      .object({
+        effect: z.enum(['confirmed', 'partial', 'unverifiable', 'suspected_noop', 'refused']),
+        route: z.enum(['trusted_input', 'dom_event']).optional(),
+        delivery: z.enum(['background', 'foreground']).optional(),
+        evidence: z.enum(['value_readback', 'window_change']).optional(),
+        status: z.literal('refused').optional(),
+        refusal: refusalShape.optional(),
+        escalation: escalationShape.optional(),
+        error: z.string().optional(),
+        accepted: z.boolean().optional(),
+        verification: z.record(z.string(), z.unknown()).optional(),
+      })
+      .passthrough();
+    return z.object({ ...common, data: data.optional() });
+  }
+  const refusalData = z
+    .object({
+      status: z.literal('refused').optional(),
+      refusal: refusalShape.optional(),
+      escalation: escalationShape.optional(),
+    })
+    .passthrough();
+  return z.object({ ...common, data: refusalData.optional() });
+}
+
 const DEFAULT_ANNOTATIONS = {
   readOnlyHint: false,
   destructiveHint: false,
@@ -265,6 +325,7 @@ export function buildMcpServer(
       {
         description: handler.definition.description,
         inputSchema: jsonSchemaToZod(handler.definition.inputSchema),
+        outputSchema: outputSchemaFor(name),
         annotations: TOOL_ANNOTATIONS[name] ?? DEFAULT_ANNOTATIONS,
       },
       async (args: unknown, extra?: { sessionId?: string }) => {
@@ -291,6 +352,22 @@ export function buildMcpServer(
             // Feed the click target's accessible name into the policy engine
             // for consequential-click keyword matching.
             ctx.targetText = live.name || undefined;
+          }
+        }
+        if (name === 'browser_click_at') {
+          const cid = strArg(a, 'capture_id');
+          const px = a['x'];
+          const py = a['y'];
+          if (cid && typeof px === 'number' && typeof py === 'number') {
+            try {
+              const under = await session.describeCapturePoint(cid, px, py);
+              if (under) {
+                ctx.targetRole = under.role || under.tag;
+                ctx.targetText = under.name || undefined;
+              }
+            } catch {
+              // stale/unknown capture: the handler refuses with a structured envelope.
+            }
           }
         }
         if (name === 'browser_upload') {
@@ -353,8 +430,25 @@ export function buildMcpServer(
           }
         }
         const result = await handler.handle(a);
+        // Screenshot evidence goes out as a real MCP image block; the base64
+        // is stripped from the JSON text/structured copy to avoid doubling it.
+        const content: Array<
+          { type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }
+        > = [];
+        let outResult = result;
+        const rd = result.data as Record<string, unknown> | undefined;
+        const shot = rd && typeof rd === 'object' ? (rd['screenshot'] as Record<string, unknown> | undefined) : undefined;
+        if (shot && typeof shot['data'] === 'string') {
+          const { data: b64, ...meta } = shot;
+          outResult = { ...result, data: { ...rd, screenshot: meta } };
+          content.push({ type: 'text' as const, text: JSON.stringify(outResult) });
+          content.push({ type: 'image' as const, data: b64 as string, mimeType: 'image/png' });
+        } else {
+          content.push({ type: 'text' as const, text: JSON.stringify(result) });
+        }
         return {
-          content: [{ type: 'text' as const, text: JSON.stringify(result) }],
+          content,
+          structuredContent: JSON.parse(JSON.stringify(outResult)) as Record<string, unknown>,
           isError: !result.ok,
         };
       },
@@ -856,4 +950,4 @@ export async function startMcpServer(
       oauth.revokeAll(); // wipe every OAuth store on stop
     },
   };
-}
+                              }
